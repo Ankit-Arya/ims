@@ -1,0 +1,27 @@
+Collected at (IST): 2026-09-14T19:43:42+05:30
+Docker logs since:   2026-09-14T00:00:00+05:30
+
+Linux itops-css-vm-01 6.12.107+deb13-cloud-amd64 #1 SMP PREEMPT_DYNAMIC Debian 6.12.107-1 (2026-08-29) x86_64 GNU/Linux
+ 14:13:42 up 5 days, 14:16,  1 user,  load average: 0.19, 0.29, 0.32
+
+               total        used        free      shared  buff/cache   available
+Mem:            31Gi       6.1Gi        18Gi       387Mi       7.4Gi        25Gi
+Swap:             0B          0B          0B
+
+Filesystem      Size  Used Avail Use% Mounted on
+udev             16G     0   16G   0% /dev
+tmpfs           3.2G  1.4M  3.2G   1% /run
+/dev/sda1       492G   76G  397G  16% /
+tmpfs            16G  4.0K   16G   1% /dev/shm
+efivarfs        256K   26K  226K  11% /sys/firmware/efi/efivars
+tmpfs           5.0M     0  5.0M   0% /run/lock
+tmpfs            16G  245M   16G   2% /tmp
+tmpfs           1.0M     0  1.0M   0% /run/credentials/systemd-resolved.service
+/dev/sda15      124M  8.9M  115M   8% /boot/efi
+tmpfs           1.0M     0  1.0M   0% /run/credentials/getty@tty1.service
+tmpfs           1.0M     0  1.0M   0% /run/credentials/serial-getty@ttyS0.service
+tmpfs           1.0M     0  1.0M   0% /run/credentials/systemd-networkd.service
+tmpfs           1.0M     0  1.0M   0% /run/credentials/systemd-journald.service
+tmpfs           3.2G  8.0K  3.2G   1% /run/user/1002
+
+CPU count: 8

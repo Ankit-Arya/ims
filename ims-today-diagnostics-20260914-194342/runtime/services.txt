@@ -1,0 +1,11 @@
+inference-query
+postgres
+migrate
+valkey
+api-1
+inference-ingest
+model-bootstrap
+api-2
+nginx
+report-worker
+worker

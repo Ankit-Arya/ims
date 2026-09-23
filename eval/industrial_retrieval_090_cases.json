@@ -1,0 +1,18 @@
+[
+  {"class":"simple_definition","intent":"bounded primary definition should use fast effort and stop early on strong evidence"},
+  {"class":"ambiguous_identifier","intent":"technical identifier should preserve all materially supported variants"},
+  {"class":"paraphrase_to_corpus_term","intent":"user language should discover organization-specific terminology from corpus intelligence"},
+  {"class":"multi_document_procedure","intent":"procedure fragments across documents should be joined without dropping conditions"},
+  {"class":"complete_responsibilities","intent":"enumeration should search document-diverse governing sections and avoid scenario-only completeness claims"},
+  {"class":"conditional_rule","intent":"recovery must preserve every original condition and cannot substitute a nearby procedure"},
+  {"class":"multi_entity","intent":"each requested entity receives independent candidate and rerank coverage"},
+  {"class":"comparison","intent":"both sides are retrieved independently before synthesis"},
+  {"class":"revision_conflict","intent":"scope, revision, authority and effective dates must remain attached to claims"},
+  {"class":"cross_document_join","intent":"synthesis joins only explicitly compatible evidence and cites each contributing source"},
+  {"class":"corpus_wide_aggregation","intent":"research route uses coverage/section aggregation rather than fixed top-k alone"},
+  {"class":"negative_claim","intent":"absence is not asserted from top-k retrieval"},
+  {"class":"lexical_exact_term","intent":"domain identifiers and exact phrases survive semantic retrieval"},
+  {"class":"semantic_paraphrase","intent":"semantic lane recovers relevant evidence when exact words differ"},
+  {"class":"evidence_survival","intent":"previously supported evidence survives recovery and broadening"},
+  {"class":"draft_context_trace","intent":"trace records exactly which evidence was sent to answer generation"}
+]

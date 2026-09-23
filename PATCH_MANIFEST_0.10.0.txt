@@ -1,0 +1,35 @@
+IMS 0.10.0 retrieval-control foundation
+
+New:
+- migrations/versions/0005_retrieval_control_foundation.py
+- src/ike/workflows/query_frame.py
+- src/ike/retrieval/vocabulary.py
+- deploy/env/0.10-query-benchmark.env
+- docs/RETRIEVAL_CONTROL_PLANE_0.10.0.md
+- docs/UPGRADE_0.10.0.md
+
+Core changes:
+- MRGR/other governing sources are bounded additive lanes, not short-circuit stages.
+- Likely-document routing is a relevance boost, not hidden hard scope.
+- Exact original query Q0 is retained before all generated hypotheses.
+- Corpus-aware trigram terminology resolution is search-only and identifier-safe.
+- Candidate lane reservations protect exact/table/governing/routed/lexical/dense evidence.
+- Generic scalar lookups can activate table retrieval without domain answer rules.
+- QueryFrame and strict structured controller payload foundation.
+- Source authority metadata (source role, authority level, supersedes relationship), including PATCH authority updates for existing documents without re-ingestion.
+- Configurable pgvector HNSW iterative scan mode.
+- Separate QUERY_CPUSET hook for query inference; report work moved to background CPU set.
+- Benchmark-only OpenVINO/512-token/24-candidate challenger environment.
+
+Not yet implemented in this foundation:
+- true concurrent speculative LangGraph fan-out (flag remains false);
+- deterministic Docling table-row atom backfill;
+- persisted generic Fact/Claim evidence table;
+- full applicability/conflict resolver;
+- OpenTelemetry production exporter;
+- SearchBackend challenger adapters / engine migration;
+- learning-to-rank.
+
+Validation:
+- Python compileall successful.
+- Focused retrieval-control/industrial/compositional/entity/query-complexity test group passed (63 tests) after final authority/premise/CPU-hook changes.

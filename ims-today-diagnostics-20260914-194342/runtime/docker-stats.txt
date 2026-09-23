@@ -1,0 +1,11 @@
+CONTAINER ID   NAME                                                CPU %     MEM USAGE / LIMIT     MEM %     NET I/O           BLOCK I/O         PIDS
+518c77ae86a8   institutional-knowledge-engine-api-1-1              0.15%     369MiB / 1.465GiB     24.60%    1.36GB / 99.3MB   83.4MB / 5.24MB   7
+ab4cc310c2fe   institutional-knowledge-engine-api-2-1              0.14%     366MiB / 1.465GiB     24.40%    1.26GB / 102MB    87.7MB / 7.98MB   7
+66bb2faf32ed   institutional-knowledge-engine-inference-ingest-1   0.17%     710.6MiB / 3.418GiB   20.30%    383kB / 23.4kB    4.76MB / 0B       10
+dca03cbb272c   institutional-knowledge-engine-inference-query-1    0.16%     3.877GiB / 5GiB       77.54%    3.23MB / 13.5MB   2.47GB / 0B       34
+3d38ad1bd9ad   institutional-knowledge-engine-nginx-1              0.00%     10.5MiB / 128MiB      8.20%     172MB / 180MB     4.74MB / 47.2MB   7
+3212c5d90f38   institutional-knowledge-engine-pgadmin-1            0.04%     293.8MiB / 512MiB     57.38%    31.9MB / 17.1MB   51.9MB / 61.8MB   13
+411c39e51f23   institutional-knowledge-engine-postgres-1           9.19%     248.1MiB / 4GiB       6.06%     39.5MB / 3.05GB   1.77GB / 88.1MB   12
+423fe3052820   institutional-knowledge-engine-report-worker-1      0.00%     0B / 0B               0.00%     0B / 0B           0B / 0B           0
+d44a0e6b397e   institutional-knowledge-engine-valkey-1             0.31%     12.45MiB / 512MiB     2.43%     86.2MB / 76.8MB   29MB / 10.3MB     8
+cab8947ba7e6   institutional-knowledge-engine-worker-1             0.23%     458.5MiB / 8GiB       5.60%     75MB / 80.8MB     1.88MB / 4.1kB    2

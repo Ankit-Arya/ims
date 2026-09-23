@@ -1,0 +1,18 @@
+IMS 0.12.0 - Dual Q&A / Real-Time patch
+
+Changed files:
+- pyproject.toml
+- src/ike/schemas/query.py
+- src/ike/services/query_execution.py
+- src/ike/workflows/qa_graph.py
+- src/ike/retrieval/engine.py
+- src/ike/web/templates/index.html
+- src/ike/web/static/app.js
+- src/ike/web/static/app.css
+- tests/test_0120_dual_experience.py
+- docs/UPGRADE_0.12.0.md
+
+No database migration. No re-ingestion. No embedding rebuild.
+Q&A defaults to Comprehensive/Research.
+Real-Time IMS uses structured operational context and a bounded fast retrieval profile.
+Rollback is code/image-only; production data is unchanged.

@@ -1,0 +1,10 @@
+/institutional-knowledge-engine-api-1-1 status=running running=true oom=false exit=0 restarts=0 started=2026-09-13T04:47:38.768559319Z finished=0001-01-01T00:00:00Z
+/institutional-knowledge-engine-api-2-1 status=running running=true oom=false exit=0 restarts=0 started=2026-09-13T04:47:38.767371389Z finished=0001-01-01T00:00:00Z
+/institutional-knowledge-engine-inference-ingest-1 status=running running=true oom=false exit=0 restarts=0 started=2026-09-13T04:16:01.212064982Z finished=0001-01-01T00:00:00Z
+/institutional-knowledge-engine-inference-query-1 status=running running=true oom=false exit=0 restarts=0 started=2026-09-13T04:16:01.210939758Z finished=0001-01-01T00:00:00Z
+/institutional-knowledge-engine-nginx-1 status=running running=true oom=false exit=0 restarts=0 started=2026-09-13T04:16:47.899088455Z finished=0001-01-01T00:00:00Z
+/institutional-knowledge-engine-pgadmin-1 status=running running=true oom=false exit=0 restarts=0 started=2026-09-11T12:53:35.648022698Z finished=0001-01-01T00:00:00Z
+/institutional-knowledge-engine-postgres-1 status=running running=true oom=false exit=0 restarts=0 started=2026-09-13T04:07:47.446729121Z finished=0001-01-01T00:00:00Z
+/institutional-knowledge-engine-report-worker-1 status=restarting running=true oom=false exit=1 restarts=1963 started=2026-09-14T14:13:01.230280977Z finished=2026-09-14T14:13:03.791894287Z
+/institutional-knowledge-engine-valkey-1 status=running running=true oom=false exit=0 restarts=0 started=2026-09-13T04:07:47.445593108Z finished=0001-01-01T00:00:00Z
+/institutional-knowledge-engine-worker-1 status=running running=true oom=false exit=0 restarts=0 started=2026-09-13T04:16:25.526353015Z finished=0001-01-01T00:00:00Z

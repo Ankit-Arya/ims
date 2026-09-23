@@ -1,0 +1,59 @@
+IMS 0.6.2 RELEASE MANIFEST
+==========================
+
+Base release: IMS 0.6.1
+Target release: IMS 0.6.2
+
+Purpose
+-------
+- Fix the 0.6.1 regression where coordinated enumeration requests such as
+  "List of depots and crew controls" were collapsed into one combined entity.
+- Search independent requested categories independently and balance protected
+  evidence across them.
+- Avoid protecting low-signal incidental mentions as if they were authoritative
+  list evidence.
+- Preserve the 0.6.1 compound-entity/facet fix for questions such as
+  "What is Crew Control and where is it located?".
+- Restore/harden the Copy answer action.
+- Add inline source citation previews on hover/focus/click using existing
+  citation metadata and excerpts.
+
+Data/runtime impact
+-------------------
+- No database migration.
+- No PDF reprocessing.
+- No OCR/rechunk/re-embedding run.
+- No embedding or reranker model change.
+- Existing IMS 0.6.1 data volumes remain compatible.
+
+Production rebuild
+------------------
+Rebuild/recreate only api-1 and api-2, then restart nginx.
+Do not rebuild inference-query, inference-ingest, worker, report-worker,
+postgres, or valkey for this hotfix.
+
+Validation completed
+--------------------
+- 81 pytest tests passed.
+- Python compileall passed.
+- Browser JavaScript syntax check passed with node --check.
+- scripts/check_062_query_plan.py passed.
+
+Modified/added release files
+----------------------------
+APPLY.md
+README.md
+docs/UPGRADE_0.6.2.md
+pyproject.toml
+scripts/check_062_query_plan.py
+src/ike/__init__.py
+src/ike/retrieval/engine.py
+src/ike/retrieval/query_plan.py
+src/ike/retrieval/table_context.py
+src/ike/web/static/app.css
+src/ike/web/static/app.js
+src/ike/workflows/qa_graph.py
+src/ike/workflows/routing.py
+src/ike/workflows/verification_policy.py
+tests/test_062_multi_entity_and_source_preview.py
+PATCH_MANIFEST_0.6.2.txt

@@ -1,0 +1,54 @@
+IMS 0.6.1 compound-entity/facet-aware retrieval patch
+====================================================
+
+Required base: IMS 0.6.0
+Reference base archive SHA-256:
+a4a1fa870cfbcc77a7d5444d248e173e039b2ba21e15257ece038bac7c0c7f35  institutional-knowledge-engine-0.6.0.zip
+
+Data impact:
+- no Alembic migration
+- no PDF reprocessing
+- no OCR rerun
+- no re-chunking
+- no re-embedding
+- no model change
+
+Runtime services requiring rebuild/recreate on an existing 0.6.0 VM:
+- api-1
+- api-2
+- nginx restart after API recreation
+
+The inference-query, inference-ingest, worker, PostgreSQL and Valkey services are unchanged by this patch.
+
+Files added/modified by this patch:
+.env.example
+APPLY.md
+README.md
+docs/UPGRADE_0.6.1.md
+pyproject.toml
+scripts/check_061_query_plan.py
+scripts/init_env.py
+src/ike/__init__.py
+src/ike/retrieval/engine.py
+src/ike/retrieval/normalization.py
+src/ike/retrieval/query_plan.py
+src/ike/workflows/qa_graph.py
+src/ike/workflows/routing.py
+src/ike/workflows/verification_policy.py
+tests/test_061_entity_attribute_retrieval.py
+tests/test_061_standalone_contract.py
+tests/test_query_coverage.py
+
+Primary generalized fixes:
+- preserve bounded multi-word entities in definition/attribute questions
+- extract requested facets such as definition/location/contact/constraint/enumeration
+- consume planner-derived lexical/exact forms before optional query expansions
+- bidirectional but conservative singular/plural bridge for PostgreSQL simple FTS
+- document-diverse entity-attribute coverage lane
+- protect entity coverage evidence from global reranker crowd-out
+- auto-route multi-facet/entity-attribute questions to Research
+- raise verification risk for multi-facet/entity coverage answers
+- block corpus-wide absence claims without completed deterministic coverage
+- fix fresh .env generation against the current .env.example DB placeholder
+
+See APPLY.md for deployment commands.

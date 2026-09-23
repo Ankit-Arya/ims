@@ -1,0 +1,52 @@
+# Optional laptop/developer override. Create .env.local with scripts/make_local_env.py,
+# then start only the services you need. Nginx/TLS is intentionally omitted from the
+# recommended local command; API-1 is available at http://127.0.0.1:8081.
+services:
+  postgres:
+    cpuset: ${LOCAL_ONLINE_CPUSET:-0-2}
+    mem_limit: ${LOCAL_POSTGRES_MEMORY_LIMIT:-2g}
+  valkey:
+    cpuset: ${LOCAL_ONLINE_CPUSET:-0-2}
+  inference-query:
+    cpuset: ${LOCAL_ONLINE_CPUSET:-0-2}
+    mem_limit: ${LOCAL_QUERY_INFERENCE_MEMORY_LIMIT:-5g}
+    environment:
+      ML_NUM_THREADS: ${LOCAL_QUERY_ML_NUM_THREADS:-3}
+    ports: !override
+      - "127.0.0.1:9090:8090"
+  inference-ingest:
+    cpuset: ${LOCAL_BACKGROUND_CPUSET:-3}
+    mem_limit: ${LOCAL_INGEST_INFERENCE_MEMORY_LIMIT:-3500m}
+    environment:
+      ML_NUM_THREADS: ${LOCAL_INGEST_ML_NUM_THREADS:-1}
+    ports : !override
+      - "127.0.0.1:9091:8091"
+  model-bootstrap:
+    env_file: .env.local
+    cpuset: ${LOCAL_BACKGROUND_CPUSET:-3}
+  migrate:
+    env_file: .env.local
+    cpuset: ${LOCAL_ONLINE_CPUSET:-0-2}
+  api-1:
+    env_file: .env.local
+    cpuset: ${LOCAL_ONLINE_CPUSET:-0-2}
+    ports: !override
+      - "127.0.0.1:18081:8080"
+
+  api-2:
+    env_file: .env.local
+    cpuset: ${LOCAL_ONLINE_CPUSET:-0-2}
+    ports: !override
+      - "127.0.0.1:18082:8080"
+
+  nginx:
+    ports: !override
+      - "127.0.0.1:18080:80"
+    volumes: !override
+      - ./deploy/nginx/ims-local.conf:/etc/nginx/conf.d/default.conf:ro
+  worker:
+    env_file: .env.local
+    cpuset: ${LOCAL_BACKGROUND_CPUSET:-3}
+  report-worker:
+    env_file: .env.local
+    cpuset: ${LOCAL_ONLINE_CPUSET:-0-2}

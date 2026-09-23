@@ -1,0 +1,74 @@
+IMS 0.8.0 retrieval-control-plane patch
+Base release: IMS 0.7.0
+Target release: IMS 0.8.0
+
+Purpose
+-------
+Generic retrieval reliability redesign. No regression answer, document UUID, station name,
+acronym expansion or expected domain fact is encoded in the production retrieval logic.
+
+Changed / added files
+---------------------
+.env.example
+APPLY.md
+README.md
+PATCH_MANIFEST_0.8.0.txt
+pyproject.toml
+
+docs/ARCHITECTURE.md
+docs/CONFIGURATION.md
+docs/MODEL_AND_RETRIEVAL.md
+docs/RETRIEVAL_CONTROL_PLANE_0.8.0.md
+docs/UPGRADE_0.8.0.md
+
+eval/retrieval_control_080_cases.json
+
+scripts/check_080_retrieval_control_plane.py
+
+src/ike/__init__.py
+src/ike/core/config.py
+src/ike/retrieval/engine.py
+src/ike/retrieval/search_plan.py
+src/ike/retrieval/source_policy.py
+src/ike/retrieval/types.py
+src/ike/services/query_execution.py
+src/ike/workflows/evidence_planning.py
+src/ike/workflows/qa_graph.py
+src/ike/workflows/query_repair.py
+
+tests/test_080_retrieval_control_plane.py
+
+Core behavior
+-------------
+1. Fast semantic evidence planning can run for ordinary multi-word natural-language queries.
+2. Planner-generated terminology is SEARCH-ONLY and cannot become answer evidence.
+3. Evidence goals carry explicit coverage contracts.
+4. Configured/selected priority sources are searched in a separate first stage.
+5. Precise lexical search remains; a separate relaxed recall lane is added.
+6. Existing section_path/search_vector fields provide bounded section navigation.
+7. Table-specific boost is gated by request structure instead of being applied to every query.
+8. Required goals receive bounded goal-local cross-encoder reranking before fan-in.
+9. An evidence-quality audit gates broadening.
+10. Incomplete priority retrieval gets one materially different AI query-repair pass first.
+11. Repair probes are scheduled before failed seed queries in targeted recovery.
+12. Auto broadens only unresolved goals after priority-source recovery remains incomplete.
+13. Retrieval trace includes source-policy, priority-stage, goal-local and repair observability.
+14. Definition/variant/list/procedure coverage is not declared complete from candidate presence alone.
+
+Compatibility
+-------------
+No PostgreSQL migration.
+No PDF re-ingestion.
+No OCR rerun.
+No re-chunking.
+No re-embedding.
+No inference model rebuild.
+Existing OVERVIEW_DOCUMENT_PATTERN is inherited when PRIORITY_DOCUMENT_PATTERNS is blank.
+
+Validation performed in artifact environment
+--------------------------------------------
+- 118 pytest tests passed.
+- scripts/check_080_retrieval_control_plane.py passed.
+- python3 -m compileall -q src scripts passed.
+- production-source scan found none of the known regression answer strings used by tests.
+- Ruff was not available in the artifact environment; no Ruff result is claimed.

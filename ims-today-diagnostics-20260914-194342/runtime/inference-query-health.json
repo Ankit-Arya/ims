@@ -1,0 +1,1 @@
+{"status":"ready","role":"query","embedding_model":"BAAI/bge-m3","rerank_model":"BAAI/bge-reranker-v2-m3","rerank_backend":"torch","device":"cpu"}

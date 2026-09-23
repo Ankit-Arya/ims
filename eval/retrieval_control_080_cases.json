@@ -1,0 +1,22 @@
+[
+  {"class":"responsibility_time","question":"Who activates the cooling plant and when?","expect":"actor and time must be independently supported"},
+  {"class":"paraphrase","question":"At what point is the cooling unit brought into service, and by whom?","expect":"search must not depend on literal wording"},
+  {"class":"predicate_homonym","question":"Who opens the service facility each morning?","expect":"facility opening must not be confused with a door/gate opening onto a location"},
+  {"class":"false_premise","question":"The backup unit can always be bypassed, correct?","expect":"premise must be verified rather than confirmation-searched"},
+  {"class":"multi_identifier","question":"AX1 BX2 CX3","expect":"independent required lookup goals"},
+  {"class":"variant_completeness","question":"What does QRS mean?","expect":"preserve all materially supported expansions/scopes"},
+  {"class":"enumeration","question":"List all duties of the shift coordinator","expect":"coverage contract must be enumerate_set"},
+  {"class":"procedure","question":"Give the complete isolation procedure for unit alpha","expect":"ordered procedure and applicability must be covered"},
+  {"class":"comparison","question":"Compare unit alpha and unit beta limits","expect":"retrieve both sides independently before comparison"},
+  {"class":"relationship","question":"How does controller alpha interact with subsystem beta?","expect":"definitions alone do not prove relationship"},
+  {"class":"condition","question":"If sensor alpha fails while pump beta is running, what action applies?","expect":"preserve condition and retrieve applicable rule"},
+  {"class":"exception","question":"When does the normal startup restriction not apply?","expect":"exceptions must be explicit evidence goals"},
+  {"class":"calculation","question":"Given the documented rate and eligible period, calculate the payable amount","expect":"retrieve and verify inputs before arithmetic"},
+  {"class":"revision","question":"Which current rule applies to unit alpha after the latest revision?","expect":"authority/revision metadata must influence evidence selection"},
+  {"class":"conflict","question":"Two manuals give different limits for unit alpha; which applies?","expect":"surface conflict and retrieve precedence/applicability evidence"},
+  {"class":"priority_source","question":"Check the selected rulebook first: who starts system alpha?","expect":"priority source must be a staged gate, not a weighted global lane"},
+  {"class":"source_scoped_negative","question":"Does the selected manual define component omega?","expect":"negative conclusion requires scoped coverage, not ordinary top-k absence"},
+  {"class":"table_value","question":"What is the maximum duration listed for category beta?","expect":"table lane may be used because the request is structurally tabular/numeric"},
+  {"class":"non_table_responsibility","question":"Who is responsible for system alpha startup?","expect":"table-specific boost should not run merely because tables exist in corpus"},
+  {"class":"recovery","question":"Who authorizes restoration after subsystem alpha trips?","expect":"failed retrieval should trigger materially different corpus-grounded repair, not tense/plural repetition"}
+]

@@ -1,0 +1,2 @@
+{"id":"definition-001","question":"What does the document define as the wake-up process?","expected_documents":["replace with exact document title"],"expected_pages":[1],"required_terms":["replace with a fact that must appear"],"mode":"auto"}
+{"id":"procedure-001","question":"What is the complete procedure for isolating the door?","expected_documents":["replace with exact operating manual title"],"expected_pages":[10,11],"required_terms":["replace with critical step"],"mode":"research"}

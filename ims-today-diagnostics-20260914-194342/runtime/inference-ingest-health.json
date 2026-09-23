@@ -1,0 +1,1 @@
+{"status":"ready","role":"ingest","embedding_model":"BAAI/bge-m3","rerank_model":null,"rerank_backend":null,"device":"cpu"}

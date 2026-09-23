@@ -1,0 +1,260 @@
+services:
+  postgres:
+    image: pgvector/pgvector:0.8.6-pg17
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-knowledge}
+      POSTGRES_USER: ${POSTGRES_USER:-knowledge}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-knowledge-local-only}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-knowledge} -d ${POSTGRES_DB:-knowledge}"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    ports:
+      - "127.0.0.1:5433:5432"
+    cpuset: ${ONLINE_CPUSET:-0-5}
+    mem_limit: ${POSTGRES_MEMORY_LIMIT:-4g}
+    restart: unless-stopped
+
+  valkey:
+    image: valkey/valkey:9.1.1-alpine
+    command: ["valkey-server", "--appendonly", "yes"]
+    volumes:
+      - valkey_data:/data
+    healthcheck:
+      test: ["CMD", "valkey-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    cpuset: ${ONLINE_CPUSET:-0-5}
+    mem_limit: ${VALKEY_MEMORY_LIMIT:-512m}
+    restart: unless-stopped
+
+  inference-query:
+    build:
+      context: .
+      dockerfile: docker/inference.Dockerfile
+      args:
+        INSTALL_OPTIMIZED_RERANK: ${INSTALL_OPTIMIZED_RERANK:-0}
+    environment:
+      INTERNAL_SERVICE_TOKEN: ${INTERNAL_SERVICE_TOKEN}
+      INFERENCE_ROLE: query
+      EMBEDDING_MODEL: ${EMBEDDING_MODEL:-BAAI/bge-m3}
+      EMBEDDING_DIM: ${EMBEDDING_DIM:-1024}
+      EMBEDDING_MAX_SEQ_LENGTH: ${EMBEDDING_MAX_SEQ_LENGTH:-1024}
+      RERANK_MODEL: ${RERANK_MODEL:-BAAI/bge-reranker-v2-m3}
+      RERANK_MAX_LENGTH: ${RERANK_MAX_LENGTH:-1024}
+      RERANK_BACKEND: ${RERANK_BACKEND:-torch}
+      ML_DEVICE: ${ML_DEVICE:-cpu}
+      ML_BATCH_SIZE: ${ML_BATCH_SIZE:-8}
+      ML_NUM_THREADS: ${QUERY_ML_NUM_THREADS:-6}
+      EMBED_CONCURRENCY: ${QUERY_EMBED_CONCURRENCY:-1}
+      RERANK_CONCURRENCY: ${QUERY_RERANK_CONCURRENCY:-1}
+      HF_HOME: /models/huggingface
+      TRANSFORMERS_CACHE: /models/huggingface
+    volumes:
+      - model_cache:/models
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8090/health', timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      retries: 60
+      start_period: 60s
+    ports:
+      - "127.0.0.1:8090:8090"
+    cpuset: ${QUERY_CPUSET:-0-5}
+    mem_limit: ${QUERY_INFERENCE_MEMORY_LIMIT:-5g}
+    restart: unless-stopped
+
+  inference-ingest:
+    build:
+      context: .
+      dockerfile: docker/inference.Dockerfile
+      args:
+        INSTALL_OPTIMIZED_RERANK: "0"
+    environment:
+      INTERNAL_SERVICE_TOKEN: ${INTERNAL_SERVICE_TOKEN}
+      INFERENCE_ROLE: ingest
+      EMBEDDING_MODEL: ${EMBEDDING_MODEL:-BAAI/bge-m3}
+      EMBEDDING_DIM: ${EMBEDDING_DIM:-1024}
+      EMBEDDING_MAX_SEQ_LENGTH: ${EMBEDDING_MAX_SEQ_LENGTH:-1024}
+      ML_DEVICE: ${ML_DEVICE:-cpu}
+      ML_BATCH_SIZE: ${ML_BATCH_SIZE:-8}
+      ML_NUM_THREADS: ${INGEST_ML_NUM_THREADS:-2}
+      EMBED_CONCURRENCY: ${INGEST_EMBED_CONCURRENCY:-1}
+      HF_HOME: /models/huggingface
+      TRANSFORMERS_CACHE: /models/huggingface
+    volumes:
+      - model_cache:/models
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8090/health', timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      retries: 60
+      start_period: 60s
+    ports:
+      - "127.0.0.1:8091:8090"
+    cpuset: ${BACKGROUND_CPUSET:-6-7}
+    mem_limit: ${INGEST_INFERENCE_MEMORY_LIMIT:-3500m}
+    restart: unless-stopped
+
+  model-bootstrap:
+    build:
+      context: .
+      dockerfile: docker/worker.Dockerfile
+    env_file: .env
+    environment:
+      HOME: /models
+      XDG_CACHE_HOME: /models/.cache
+      HF_HOME: /models/huggingface
+      TRANSFORMERS_CACHE: /models/huggingface
+      DOCLING_ARTIFACTS_PATH: ${DOCLING_ARTIFACTS_PATH:-/models/docling}
+      TESSERACT_OMP_THREAD_LIMIT: ${TESSERACT_OMP_THREAD_LIMIT:-1}
+    command: ["python", "-m", "ike.services.model_bootstrap"]
+    volumes:
+      - model_cache:/models
+    cpuset: ${BACKGROUND_CPUSET:-6-7}
+    mem_limit: ${MODEL_BOOTSTRAP_MEMORY_LIMIT:-4g}
+    restart: "no"
+
+  migrate:
+    build:
+      context: .
+      dockerfile: docker/api.Dockerfile
+    env_file: .env
+    command: ["alembic", "upgrade", "head"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    cpuset: ${ONLINE_CPUSET:-0-5}
+    mem_limit: ${MIGRATE_MEMORY_LIMIT:-1g}
+
+  api-1:
+    build:
+      context: .
+      dockerfile: docker/api.Dockerfile
+    env_file: .env
+    command: ["uvicorn", "ike.main:app", "--host", "0.0.0.0", "--port", "8080", "--workers", "1", "--proxy-headers", "--forwarded-allow-ips", "*"]
+    volumes:
+      - shared_data:/data
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      valkey:
+        condition: service_healthy
+      inference-query:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:8081:8080"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/health/live', timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+    cpuset: ${ONLINE_CPUSET:-0-5}
+    mem_limit: ${API_MEMORY_LIMIT:-1g}
+    restart: unless-stopped
+
+  api-2:
+    build:
+      context: .
+      dockerfile: docker/api.Dockerfile
+    env_file: .env
+    command: ["uvicorn", "ike.main:app", "--host", "0.0.0.0", "--port", "8080", "--workers", "1", "--proxy-headers", "--forwarded-allow-ips", "*"]
+    volumes:
+      - shared_data:/data
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      valkey:
+        condition: service_healthy
+      inference-query:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:8082:8080"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/health/live', timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+    cpuset: ${ONLINE_CPUSET:-0-5}
+    mem_limit: ${API_MEMORY_LIMIT:-1g}
+    restart: unless-stopped
+
+  nginx:
+    image: nginx:1.28.0-alpine
+    depends_on:
+      api-1:
+        condition: service_healthy
+      api-2:
+        condition: service_healthy
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./deploy/nginx/ims.conf:/etc/nginx/conf.d/default.conf:ro
+      - ${TLS_CERT_DIR:-/etc/ims/tls}/fullchain.pem:/etc/nginx/tls/fullchain.pem:ro
+      - ${TLS_CERT_DIR:-/etc/ims/tls}/dmrc.key:/etc/nginx/tls/dmrc.key:ro
+    cpuset: ${ONLINE_CPUSET:-0-5}
+    mem_limit: ${NGINX_MEMORY_LIMIT:-128m}
+    restart: unless-stopped
+
+  worker:
+    build:
+      context: .
+      dockerfile: docker/worker.Dockerfile
+    env_file: .env
+    environment:
+      HOME: /models
+      XDG_CACHE_HOME: /models/.cache
+      HF_HOME: /models/huggingface
+      TRANSFORMERS_CACHE: /models/huggingface
+      DOCLING_ARTIFACTS_PATH: ${DOCLING_ARTIFACTS_PATH:-/models/docling}
+      TESSERACT_OMP_THREAD_LIMIT: ${TESSERACT_OMP_THREAD_LIMIT:-1}
+    command: ["python", "-m", "ike.tasks.worker_bootstrap"]
+    volumes:
+      - shared_data:/data
+      - model_cache:/models
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      model-bootstrap:
+        condition: service_completed_successfully
+      valkey:
+        condition: service_healthy
+      inference-ingest:
+        condition: service_healthy
+    cpuset: ${BACKGROUND_CPUSET:-6-7}
+    mem_limit: ${WORKER_MEMORY_LIMIT:-8g}
+    restart: unless-stopped
+
+  report-worker:
+    build:
+      context: .
+      dockerfile: docker/api.Dockerfile
+    env_file: .env
+    environment:
+      HOME: /models
+      XDG_CACHE_HOME: /models/.cache
+    command: ["celery", "-A", "ike.tasks.celery_app:celery_app", "worker", "--loglevel=INFO", "-Q", "reports", "--concurrency=${REPORT_WORKER_CONCURRENCY:-1}", "--prefetch-multiplier=1", "--max-tasks-per-child=${REPORT_MAX_TASKS_PER_CHILD:-10}"]
+    volumes:
+      - shared_data:/data
+      - model_cache:/models
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      valkey:
+        condition: service_healthy
+    cpuset: ${BACKGROUND_CPUSET:-6-7}
+    mem_limit: ${REPORT_WORKER_MEMORY_LIMIT:-2g}
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
+  valkey_data:
+  model_cache:
+  shared_data:

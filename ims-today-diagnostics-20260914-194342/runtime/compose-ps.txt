@@ -1,0 +1,15 @@
+NAME                                                IMAGE                                             COMMAND                  SERVICE            CREATED        STATUS                          PORTS
+institutional-knowledge-engine-api-1                institutional-knowledge-engine-api                "uvicorn ike.main:ap…"   api                6 days ago     Exited (0) 4 days ago           
+institutional-knowledge-engine-api-1-1              institutional-knowledge-engine-api-1              "uvicorn ike.main:ap…"   api-1              33 hours ago   Up 33 hours (healthy)           127.0.0.1:8081->8080/tcp
+institutional-knowledge-engine-api-2-1              institutional-knowledge-engine-api-2              "uvicorn ike.main:ap…"   api-2              33 hours ago   Up 33 hours (healthy)           127.0.0.1:8082->8080/tcp
+institutional-knowledge-engine-inference-1          institutional-knowledge-engine-inference          "uvicorn inference_s…"   inference          10 days ago    Exited (0) 4 days ago           
+institutional-knowledge-engine-inference-ingest-1   institutional-knowledge-engine-inference-ingest   "uvicorn inference_s…"   inference-ingest   34 hours ago   Up 34 hours (healthy)           127.0.0.1:8091->8090/tcp
+institutional-knowledge-engine-inference-query-1    institutional-knowledge-engine-inference-query    "uvicorn inference_s…"   inference-query    34 hours ago   Up 34 hours (healthy)           127.0.0.1:8090->8090/tcp
+institutional-knowledge-engine-migrate-1            institutional-knowledge-engine-migrate            "alembic upgrade head"   migrate            34 hours ago   Exited (0) 34 hours ago         
+institutional-knowledge-engine-model-bootstrap-1    institutional-knowledge-engine-model-bootstrap    "python -m ike.servi…"   model-bootstrap    34 hours ago   Exited (0) 34 hours ago         
+institutional-knowledge-engine-nginx-1              nginx:1.28.0-alpine                               "/docker-entrypoint.…"   nginx              34 hours ago   Up 34 hours                     0.0.0.0:80->80/tcp, [::]:80->80/tcp, 0.0.0.0:443->443/tcp, [::]:443->443/tcp
+institutional-knowledge-engine-pgadmin-1            dpage/pgadmin4:9.17                               "/entrypoint.sh"         pgadmin            3 days ago     Up 3 days                       443/tcp, 127.0.0.1:5050->80/tcp
+institutional-knowledge-engine-postgres-1           pgvector/pgvector:0.8.6-pg17                      "docker-entrypoint.s…"   postgres           34 hours ago   Up 34 hours (healthy)           127.0.0.1:5433->5432/tcp
+institutional-knowledge-engine-report-worker-1      institutional-knowledge-engine-report-worker      "celery -A ike.tasks…"   report-worker      34 hours ago   Restarting (1) 39 seconds ago   
+institutional-knowledge-engine-valkey-1             valkey/valkey:9.1.1-alpine                        "docker-entrypoint.s…"   valkey             34 hours ago   Up 34 hours (healthy)           6379/tcp
+institutional-knowledge-engine-worker-1             institutional-knowledge-engine-worker             "python -m ike.tasks…"   worker             34 hours ago   Up 34 hours                     

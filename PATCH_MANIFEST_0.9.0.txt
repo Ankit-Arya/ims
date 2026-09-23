@@ -1,0 +1,34 @@
+IMS 0.9.0 industrial retrieval patch (apply over 0.8.0)
+
+New:
+- migrations/versions/0004_retrieval_intelligence.py
+- src/ike/retrieval/corpus_intelligence.py
+- src/ike/retrieval/evidence_ledger.py
+- src/ike/retrieval/context_assembly.py
+- src/ike/workflows/query_understanding.py
+- scripts/build_retrieval_intelligence.py
+- scripts/check_090_industry_retrieval.py
+- tests/test_090_industrial_retrieval.py
+- eval/industrial_retrieval_090_cases.json
+- docs/INDUSTRIAL_RETRIEVAL_0.9.0.md
+- docs/UPGRADE_0.9.0.md
+- PATCH_MANIFEST_0.9.0.txt
+
+Modified:
+- .env.example
+- README.md
+- APPLY.md
+- pyproject.toml
+- inference_service/main.py
+- src/ike/__init__.py
+- src/ike/core/config.py
+- src/ike/db/models.py
+- src/ike/ingestion/processor.py
+- src/ike/retrieval/engine.py
+- src/ike/services/inference_client.py
+- src/ike/workflows/evidence_planning.py
+- src/ike/workflows/qa_graph.py
+- src/ike/workflows/query_repair.py
+- docs/ARCHITECTURE.md
+- docs/MODEL_AND_RETRIEVAL.md
+- docs/EVALUATION.md

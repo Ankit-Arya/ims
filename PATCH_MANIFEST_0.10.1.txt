@@ -1,0 +1,38 @@
+IMS 0.10.1 stateless Q&A patch
+Baseline: IMS 0.10.0 foundation R1
+
+Purpose
+- Remove all cross-query/session retrieval context from Q&A.
+- A new question does not inherit line, rolling stock, prior question text, prior answer, citations, or search results.
+- Current-request document_ids remain an explicit hard scope when supplied by the user.
+- ACLs, indexed corpus metadata, same-query QueryFrame expansion, global retrieval, and governing-reference retrieval remain unchanged.
+
+Runtime files changed
+- src/ike/services/query_execution.py
+- src/ike/workflows/qa_graph.py
+- src/ike/api/routes/query.py
+- src/ike/services/conversation_context.py (deprecated inert compatibility shim)
+- src/ike/web/static/app.js
+- src/ike/web/static/app.css
+- src/ike/web/templates/index.html
+- src/ike/__init__.py
+- pyproject.toml
+
+Documentation/tests
+- README.md
+- docs/UPGRADE_0.10.1.md
+- tests/test_0101_stateless_query_contract.py
+
+Database impact
+- No database migration.
+- No schema change.
+- No PDF reprocessing.
+- No OCR.
+- No re-embedding.
+- No retrieval-intelligence backfill.
+- No environment-variable change required.
+
+Deployment impact
+- Rebuild/recreate api-1 and api-2 only for the runtime change.
+- Postgres, Valkey, inference services, workers, model cache, and named volumes do not need to be recreated.
+- Never use `docker compose down -v`.

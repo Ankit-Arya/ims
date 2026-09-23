@@ -1,0 +1,91 @@
+IMS 0.7.0 COMPOSITIONAL RETRIEVAL PATCH MANIFEST
+=================================================
+Base: IMS 0.6.2
+Target: IMS 0.7.0
+
+PURPOSE
+-------
+Generalized Q&A architecture upgrade for multi-term, multi-entity, multi-attribute,
+comparison, relationship, false-premise, conditional, multi-hop, conflict, temporal,
+calculation, indirect, typo-tolerant and multilingual questions.
+
+This patch does NOT encode expected answers, locations, acronym expansions, line mappings,
+compensation rules, or other corpus-specific facts. Regression examples appear only in
+tests/evaluation material. Domain facts continue to come from accessible indexed documents.
+
+CORE BEHAVIOR
+-------------
+- Build atomic evidence goals before retrieval.
+- Optionally use a fast semantic planner for structurally rich/indirect wording.
+- Preserve literal identifiers, numbers, negation, exceptions, conditions and user clauses.
+- Search required goals independently instead of requiring all terms to co-occur.
+- Search configured overview documents once per atomic goal in compositional mode.
+- Reserve bounded candidate/evidence capacity per required goal before global reranking.
+- Audit goal satisfaction using only evidence attributed to that goal.
+- Perform one bounded targeted recovery pass for missing/partial goals.
+- Give recovered evidence first admission to the bounded merged context.
+- Require actual evidence for relationships/causation/override/applicability/entitlement.
+- Treat user premises and confirmation wording as claims to verify.
+- Detect conflict/precedence wording before legacy entity/facet shortcuts.
+- Preserve Unicode word boundaries and allow multilingual semantic planning.
+- Fail semantic-planner errors toward Research/verification rather than confident Direct.
+- Never infer corpus-wide negative inventory from ordinary top-k absence.
+- Persist goal plan/satisfaction/recovery diagnostics and bounded Prometheus metrics.
+
+DATABASE / CORPUS
+-----------------
+No database migration.
+No PDF reprocessing.
+No OCR rerun.
+No re-chunking.
+No re-embedding.
+No model-cache reset.
+
+VM REBUILD
+----------
+Rebuild/recreate only api-1 and api-2, then restart nginx.
+Do not rebuild inference-query, inference-ingest, worker, report-worker, postgres, valkey,
+or model-bootstrap for this patch.
+
+MODIFIED FILES
+--------------
+.env.example
+APPLY.md
+README.md
+docs/CONFIGURATION.md
+pyproject.toml
+src/ike/__init__.py
+src/ike/core/config.py
+src/ike/retrieval/engine.py
+src/ike/services/query_execution.py
+src/ike/services/query_metrics.py
+src/ike/workflows/qa_graph.py
+src/ike/workflows/routing.py
+src/ike/workflows/verification_policy.py
+
+ADDED FILES
+-----------
+PATCH_MANIFEST_0.7.0.txt
+docs/COMPOSITIONAL_QA_0.7.0.md
+docs/UPGRADE_0.7.0.md
+eval/compositional_070_cases.json
+scripts/check_070_compositional_plan.py
+src/ike/workflows/evidence_planning.py
+tests/test_070_compositional_retrieval.py
+
+PRESERVED UI
+------------
+The 0.6.2 resilient Copy action and inline citation hover/focus source preview are preserved.
+Browser JS/CSS/templates are unchanged by this backend architecture upgrade.
+
+VALIDATION TARGETS
+------------------
+- Python compileall
+- 0.7.0 DB-free planner smoke check
+- complete repository pytest suite
+- JavaScript syntax check for the preserved browser application
+- pristine 0.6.2 + patch overlay byte comparison
+- ZIP integrity and SHA-256 checks
+
+See APPLY.md and docs/UPGRADE_0.7.0.md for deployment and rollback steps.
+See docs/COMPOSITIONAL_QA_0.7.0.md and eval/compositional_070_cases.json for capability boundaries.

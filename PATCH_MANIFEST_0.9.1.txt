@@ -1,0 +1,24 @@
+IMS 0.9.1 - Corpus Intelligence Efficiency and Coverage Safety
+Base: IMS 0.9.0
+
+Changed/new files:
+.env.example
+APPLY.md
+README.md
+PATCH_MANIFEST_0.9.1.txt
+docs/CORPUS_INTELLIGENCE_0.9.1.md
+docs/UPGRADE_0.9.1.md
+pyproject.toml
+scripts/build_retrieval_intelligence.py
+scripts/check_090_industry_retrieval.py
+scripts/check_091_corpus_intelligence.py
+src/ike/__init__.py
+src/ike/core/config.py
+src/ike/ingestion/processor.py
+src/ike/retrieval/corpus_intelligence.py
+src/ike/workflows/qa_graph.py
+tests/test_091_corpus_intelligence_efficiency.py
+
+No database migration is added. Existing 0004 retrieval_nodes is retained.
+No PDF reprocessing, OCR, re-chunking or factual chunk re-embedding is required.
+Existing 0.9.0 retrieval_nodes are secondary/rebuildable and are upgraded document-by-document.
