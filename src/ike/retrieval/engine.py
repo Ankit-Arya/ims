@@ -36,6 +36,7 @@ from ike.retrieval.role import (
 )
 from ike.retrieval.types import Candidate, Evidence
 from ike.services.inference_client import InferenceClient
+from ike.services.jev import JevEvidenceJudge
 from ike.workflows.routing import (
     coverage_search_query,
     extract_lookup_term,
@@ -63,6 +64,7 @@ class RetrievalEngine:
         self.db = db
         self.settings = get_settings()
         self.inference = InferenceClient.for_query()
+        self.jev = JevEvidenceJudge(self.settings)
         self.corpus_intelligence = CorpusIntelligence(db)
         self._hnsw_configured = False
         if RetrievalEngine._role_alias_cache is None:
@@ -2734,6 +2736,13 @@ class RetrievalEngine:
                 candidate.final_retrieval_score = result.score
                 candidate.rank_method = "cross_encoder"
                 final_candidates.append(candidate)
+
+        jev_started = time.perf_counter()
+        final_candidates, jev_details = self.jev.judge_and_apply(question, final_candidates)
+        timings_ms["jev"] = int((time.perf_counter() - jev_started) * 1000)
+        if jev_details.get("called"):
+            rerank_details = dict(rerank_details or {})
+            rerank_details["jev"] = jev_details
 
         timings_ms["rerank"] = int((time.perf_counter() - rerank_started) * 1000)
 

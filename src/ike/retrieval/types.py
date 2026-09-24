@@ -26,6 +26,8 @@ class Candidate:
     rerank_score: float = 0.0
     final_retrieval_score: float = 0.0
     rank_method: str = "unranked"
+    judge_score: float = 0.0
+    judge_details: dict[str, float] = field(default_factory=dict)
     goal_rerank_scores: dict[str, float] = field(default_factory=dict)
     sources: set[str] = field(default_factory=set)
 

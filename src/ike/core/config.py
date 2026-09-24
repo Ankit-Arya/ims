@@ -316,6 +316,21 @@ class Settings(BaseSettings):
     llm_max_output_tokens: int = 7000
     verify_mode: Literal["off", "selective", "always"] = "selective"
 
+    # Local OKF + Jev experiment. Disabled unless explicitly enabled in .env.
+    okf_enabled: bool = False
+    okf_bundle_dir_name: str = "okf"
+    okf_profile_enrichment_enabled: bool = True
+
+    jev_mode: Literal["off", "shadow", "apply"] = "off"
+    typesafe_api_key: str = ""
+    jev_base_url: str = "https://api.typesafe.ai"
+    jev_model: str = "jev-latest"
+    jev_timeout_seconds: float = 6.0
+    jev_max_candidates: int = 16
+    jev_candidate_chars: int = 2600
+    jev_weight: float = 0.55
+    jev_fail_open: bool = True
+
     bootstrap_admin_username: str = "admin"
     bootstrap_admin_password: str = "change-this-before-running"
     bootstrap_admin_department: str = "platform"
@@ -373,6 +388,10 @@ class Settings(BaseSettings):
     @property
     def visual_cache_dir(self) -> Path:
         return self.data_root / self.visual_cache_dir_name
+
+    @property
+    def okf_bundle_dir(self) -> Path:
+        return self.data_root / self.okf_bundle_dir_name
 
 
 @lru_cache

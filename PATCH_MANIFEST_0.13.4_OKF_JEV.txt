@@ -1,0 +1,19 @@
+IMS OKF + Jev local-test patch for IMS 0.13.4
+Base commit: 3e29df47f647c5d9c533bced44908615a23f9cdc
+
+REPLACE:
+src/ike/core/config.py
+src/ike/retrieval/types.py
+src/ike/ingestion/processor.py
+src/ike/retrieval/engine.py
+
+ADD:
+src/ike/services/okf.py
+src/ike/services/jev.py
+tests/test_0134_okf_jev.py
+scripts/backfill_okf.py
+docs/OKF_JEV_LOCAL_TEST.md
+OKF_JEV.env.example
+
+NO DATABASE MIGRATION.
+DEFAULT BEHAVIOR STAYS OFF UNTIL ENV FLAGS ARE SET.

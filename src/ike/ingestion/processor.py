@@ -10,6 +10,8 @@ from ike.retrieval.corpus_intelligence import build_nodes_for_document
 from ike.db.session import SessionLocal
 from ike.ingestion.docling_pipeline import get_docling_pipeline
 from ike.services.inference_client import InferenceClient
+from ike.services.metadata_enrichment import infer_operational_profile
+from ike.services.okf import write_document_concept
 from ike.services.storage import LocalStorage
 
 logger = logging.getLogger(__name__)
@@ -70,6 +72,23 @@ def process_document(document_id: UUID) -> None:
             document.parsed_path = str(canonical_path)
             document.ingestion_status = "ready"
             document.ingestion_error = None
+            if settings.okf_enabled:
+                metadata = dict(document.extra_metadata or {})
+                profile = dict(metadata.get("operational_profile") or {})
+                if settings.okf_profile_enrichment_enabled and not profile:
+                    profile = infer_operational_profile(
+                        document.title,
+                        document.original_filename,
+                        [chunk.contextual_text for chunk in parsed.chunks[:20]],
+                    )
+                    metadata["operational_profile"] = profile
+                try:
+                    okf_path = write_document_concept(document, parsed.chunks, profile, settings.okf_bundle_dir)
+                    metadata["okf"] = {"status": "ready", "version": "0.2", "concept_path": str(okf_path)}
+                except Exception as okf_exc:
+                    logger.exception("okf_generation_failed", extra={"document_id": str(document_id)})
+                    metadata["okf"] = {"status": "failed", "version": "0.2", "error": str(okf_exc)[:1000]}
+                document.extra_metadata = metadata
             db.commit()
 
         # 0.9 corpus intelligence is a secondary index. A failure here must never roll back
