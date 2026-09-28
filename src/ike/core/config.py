@@ -320,8 +320,19 @@ class Settings(BaseSettings):
     okf_enabled: bool = False
     okf_bundle_dir_name: str = "okf"
     okf_profile_enrichment_enabled: bool = True
+    okf_query_enabled: bool = True
+    okf_query_max_documents: int = 12
+    okf_query_fusion_bonus: float = 0.18
+    okf_query_reserve_candidates: int = 4
+    okf_query_targeted_reserve: int = 8
 
     jev_mode: Literal["off", "shadow", "apply"] = "off"
+
+    # auto:
+    #   jv_live_* -> hosted jevtypesafeai.com gateway
+    #   anything else -> official TypeSafe API
+    jev_provider: Literal["auto", "typesafe", "hosted"] = "auto"
+
     typesafe_api_key: str = ""
     jev_base_url: str = "https://api.typesafe.ai"
     jev_model: str = "jev-latest"
@@ -330,6 +341,13 @@ class Settings(BaseSettings):
     jev_candidate_chars: int = 2600
     jev_weight: float = 0.55
     jev_fail_open: bool = True
+
+    # Complex/compositional Jev judging reuses IMS evidence goals instead of judging
+    # every passage only against the broad parent question.
+    jev_complex_enabled: bool = True
+    jev_complex_candidate_chars: int = 1800
+    jev_max_goal_pairs: int = 24
+    jev_max_goals_per_candidate: int = 2
 
     bootstrap_admin_username: str = "admin"
     bootstrap_admin_password: str = "change-this-before-running"

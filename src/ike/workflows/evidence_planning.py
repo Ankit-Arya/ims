@@ -382,10 +382,23 @@ def _content_tokens(value: str) -> set[str]:
     }
 
 
+def _normalize_identifier_plurals(value: str) -> str:
+    normalized = value
+    for raw in _word_tokens(value):
+        if len(raw) > 2 and raw.endswith("s") and raw[:-1].isupper():
+            normalized = normalized.replace(raw, raw[:-1])
+    return normalized
+
+
 def standalone_identifiers(question: str) -> list[str]:
     """Return explicit technical-looking identifiers in user text without guessing expansions."""
 
     values: list[str] = []
+    for raw in _word_tokens(question):
+        if len(raw) > 2 and raw.endswith("s") and raw[:-1].isupper():
+            token = raw[:-1]
+            if token.upper() not in _IDENTIFIER_STOP and token not in values:
+                values.append(token)
     for match in _IDENTIFIER_RE.finditer(question):
         token = match.group(1)
         pieces = (
@@ -444,6 +457,182 @@ def _clause_fragments(question: str, *, limit: int = 6) -> list[str]:
     return cleaned if len(cleaned) >= 2 else [text]
 
 
+
+
+
+def _multipart_units(question: str, *, limit: int = 8) -> list[str]:
+    """Split explicit sibling asks while preserving setup/context clauses."""
+    text = re.sub(r"\s+", " ", question.strip())
+
+    # "Separately" is an explicit independence marker and must split even when the
+    # following clause does not start with a wh-word.
+    text = re.sub(r"\s*,?\s+and\s+separately\s+", " ; separately ", text, flags=re.IGNORECASE)
+    text = re.sub(r"\s*,?\s+separately\s+", " ; separately ", text, flags=re.IGNORECASE)
+
+    parts = re.split(
+        r"\s*;\s*|"
+        r"\s*,\s*(?=(?:and\s+)?(?:what|who|which|where|when|how|can|should|does|do|is|are)\b)|"
+        r"\s+and\s+(?=(?:what|who|which|where|when|how|can|should|does|do|is|are)\b)",
+        text,
+        flags=re.IGNORECASE,
+    )
+    cleaned = _unique((part.strip(" ,.?") for part in parts if len(part.strip()) >= 4), limit=limit)
+    return cleaned if len(cleaned) >= 2 else [text]
+
+
+def _setup_context(unit: str) -> str | None:
+    """Return an explicit setup/source/scenario clause that later asks should inherit."""
+    text = re.sub(r"\s+", " ", unit.strip(" ,.?"))
+    patterns = (
+        r"^(?:if|when|whenever|while)\s+(.+)$",
+        r"^(?:for|during|under|in\s+case\s+of|in\s+the\s+event\s+of)\s+(.+)$",
+        r"^(?:as\s+per|according\s+to|from|under)\s+(.+)$",
+    )
+    for pattern in patterns:
+        match = re.match(pattern, text, re.IGNORECASE)
+        if match:
+            context = match.group(1).strip(" ,.?")
+            if context:
+                return context[:140]
+    return None
+
+
+def _shared_context_anchor(question: str, units: list[str]) -> str | None:
+    """Infer shared context from explicit setup plus conservative dependency cues."""
+    if len(units) < 2 or re.search(r"\bseparately\b", question, re.IGNORECASE):
+        return None
+
+    first = units[0]
+    setup = _setup_context(first)
+    if setup:
+        return setup
+
+    match = re.search(
+        r"\b(?:during|under|while|when|in\s+case\s+of|in\s+the\s+event\s+of)\s+"
+        r"([^,;?.]{2,90})",
+        first,
+        re.IGNORECASE,
+    )
+    if match:
+        anchor = re.sub(r"\s+", " ", match.group(1)).strip(" .")
+        anchor = re.split(
+            r"\b(?:what|who|which|where|when|how|can|should)\b",
+            anchor,
+            maxsplit=1,
+            flags=re.IGNORECASE,
+        )[0].strip()
+        if anchor:
+            return anchor[:120]
+
+    # Later pronoun/generic follow-ups usually inherit the first ask's topic.
+    dependent = 0
+    for unit in units[1:]:
+        lowered = unit.casefold().strip()
+        if re.match(
+            r"^(?:who|when|can\b|should\b|what\s+(?:action|actions|checks|precautions|"
+            r"restriction|restrictions|speed|records|refund|reissue|preconditions|steps|duties))",
+            lowered,
+        ):
+            dependent += 1
+        elif re.search(r"\b(?:it|they|this|that|the\s+train|the\s+staff|the\s+operator)\b", lowered):
+            dependent += 1
+
+    if dependent == len(units) - 1 and dependent:
+        tokens = [
+            token for token in _word_tokens(first)
+            if token.casefold() not in _GENERIC_QUERY_WORDS
+            and token.casefold() not in {
+                "what","who","when","where","which","how","are","is","does","do","should",
+                "can","the","a","an","of","for","to","on","or","and",
+            }
+        ]
+        anchor = " ".join(tokens[:10]).strip()
+        return anchor[:140] or None
+
+    return None
+
+
+def _multipart_goal_kind(fragment: str) -> str:
+    lowered = fragment.casefold()
+    if re.search(r"\bconditions?\b|\bwhen\b|\bunder\s+what\b", lowered):
+        return "condition"
+    if re.search(r"\bwho\b|\bresponsible\b|\bdut(?:y|ies)\b", lowered):
+        return "responsibility"
+    if re.search(r"\bactions?\b|\bwhat\s+(?:shall|should|must|does?)\b|\bprocedure\b|\bsteps?\b", lowered):
+        return "procedure"
+    if re.search(r"\bspeed\b|\blimit\b|\brestrictions?\b|\bvalue\b|\brate\b", lowered):
+        return "attribute"
+    return "fact"
+
+
+def _build_multipart_plan(question: str, query_plan: QueryPlan) -> EvidencePlan | None:
+    units = _multipart_units(question)
+    if len(units) < 2:
+        return None
+
+    explicit_independent = bool(re.search(r"\bseparately\b", question, re.IGNORECASE))
+    anchor = None if explicit_independent else _shared_context_anchor(question, units)
+    setup = _setup_context(units[0]) if anchor else None
+
+    goal_units = list(units)
+    if setup and len(units) > 1:
+        # The first unit is a setup/constraint, not a standalone answer request.
+        goal_units = units[1:]
+
+    goals: list[EvidenceGoal] = []
+    for index, raw_unit in enumerate(goal_units, start=1):
+        unit = re.sub(r"^separately\s+", "", raw_unit, flags=re.IGNORECASE).strip()
+        kind = _multipart_goal_kind(unit)
+        target = unit
+        if anchor and anchor.casefold() not in unit.casefold():
+            target = f"{unit} in the shared context of {anchor}"
+        goal_entities = _unique(standalone_identifiers(target))
+        combined_entities = " ".join(goal_entities)
+        coverage = (
+            "ordered_procedure" if kind == "procedure"
+            else "enumerate_set" if kind == "responsibility"
+            else "conditional_rule" if kind == "condition"
+            else "scalar_with_condition" if kind == "attribute"
+            else "single_fact"
+        )
+        qualifiers = [f"shared_context:{anchor}"] if anchor else ["independent_subquery"]
+        if setup:
+            qualifiers.append(f"inherited_context:{setup}")
+        goals.append(
+            EvidenceGoal(
+                id=f"g{index}",
+                kind=kind,
+                question=target,
+                # Keep atomic goal retrieval isolated. The parent question is handled
+                # separately by the retrieval engine when appropriate; attaching it to
+                # every goal causes one broad formulation to be attributed to all goals.
+                search_queries=_unique([_normalize_identifier_plurals(target), combined_entities, unit], limit=3),
+                # Keep entities local to the atomic ask. Global entity inheritance
+                # makes identifiers from one independent subquery leak into every goal.
+                entity_terms=goal_entities,
+                required=True,
+                qualifiers=qualifiers,
+                coverage_contract=coverage,
+            )
+        )
+
+    if not goals:
+        return None
+
+    return EvidencePlan(
+        original=question,
+        strategy="multi_hop" if anchor else "multi_lookup",
+        entities=_unique(query_plan.entity_terms),
+        goals=goals,
+        requires_decomposition=True,
+        needs_research=True,
+        needs_verification=True,
+        warnings=[
+            f"multipart_shared_context:{anchor}" if anchor else "multipart_independent_subqueries"
+        ],
+    )
+
+
 def build_deterministic_evidence_plan(question: str, query_plan: QueryPlan) -> EvidencePlan:
     """Build a safe evidence-requirement plan without domain-specific assumptions.
 
@@ -452,6 +641,41 @@ def build_deterministic_evidence_plan(question: str, query_plan: QueryPlan) -> E
     """
 
     original = re.sub(r"\s+", " ", (query_plan.normalized or question).strip())
+
+    # Attribute/limit questions with explicit applicability constraints must remain one
+    # constrained evidence goal. Do this before acronym-definition shortcuts.
+    if _SCALAR_LOOKUP_RE.search(original) and re.search(r"\b(?:speed|limit|rate|value|amount|maximum|minimum|max|min)\b", original, re.IGNORECASE):
+        qualifiers = []
+        for label, value in (
+            ("source", query_plan.source_scope),
+            ("line", query_plan.line),
+            ("rolling_stock", query_plan.rolling_stock),
+            ("system", query_plan.system),
+            ("subsystem", query_plan.subsystem),
+            ("scenario", query_plan.scenario),
+        ):
+            if value:
+                qualifiers.append(f"{label}:{value}")
+        return EvidencePlan(
+            original=original,
+            strategy="conditional" if qualifiers else "single",
+            entities=_unique(query_plan.entity_terms),
+            goals=[EvidenceGoal(
+                id="g1",
+                kind="attribute",
+                question=original,
+                search_queries=_unique([original, *query_plan.semantic_queries, *query_plan.lexical_queries], limit=5),
+                entity_terms=_unique(query_plan.entity_terms),
+                required=True,
+                qualifiers=qualifiers,
+                coverage_contract="scalar_with_condition",
+            )],
+            requires_decomposition=False,
+            needs_research=bool(qualifiers),
+            needs_verification=True,
+            warnings=["constrained_attribute_query"] if qualifiers else [],
+        )
+
     identifiers = standalone_identifiers(original)
     if query_plan.source_scope:
         scope_compact = re.sub(r"[^a-z0-9]", "", query_plan.source_scope.casefold())
@@ -480,6 +704,14 @@ def build_deterministic_evidence_plan(question: str, query_plan: QueryPlan) -> E
         entities = identifiers
 
     goals: list[EvidenceGoal] = []
+
+    # Explicit sibling sub-questions must be interpreted before legacy facet shortcuts.
+    # This distinguishes one shared scenario with several requested facets from genuinely
+    # independent questions, and prevents entity extraction (for example TO/SC) from
+    # hijacking the whole request into unrelated authority goals.
+    multipart_plan = _build_multipart_plan(original, query_plan)
+    if multipart_plan is not None:
+        return multipart_plan
 
     # Keep explicit requested aspects independent. This prevents a compound question
     # from being collapsed into one generic definition/fact goal.

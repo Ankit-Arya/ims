@@ -25,5 +25,5 @@ def applicability_score(plan: QueryPlan, candidate: Candidate) -> float:
     if plan.rolling_stock:
         values = [str(x) for x in profile.get("rolling_stock", []) if x]
         if values:
-            score += 0.22 if any(_canon(v) == _canon(plan.rolling_stock) for v in values) else -0.10
+            score += 0.38 if any(_canon(v) == _canon(plan.rolling_stock) for v in values) else -0.32
     return score

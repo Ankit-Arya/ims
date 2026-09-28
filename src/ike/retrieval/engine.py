@@ -1312,6 +1312,7 @@ class RetrievalEngine:
         include_base_query: bool = True,
         source_stage: str = "all",
         boost_document_ids: list[UUID] | None = None,
+        priority_document_ids: list[UUID] | None = None,
         request_id: str | None = None,
         progress: ProgressFn | None = None,
         progress_points: tuple[int, int, int, int] | None = None,
@@ -1319,6 +1320,11 @@ class RetrievalEngine:
         started = time.perf_counter()
         query_plan = query_plan or build_query_plan(question)
         lookup_term = query_plan.lookup_term if include_base_query else None
+        # A base-query definition lookup must never dominate a decomposed request.
+        # Definition evidence for multipart questions is retrieved through the relevant
+        # goal formulations instead of being globally protected across all goals.
+        if evidence_plan is not None and evidence_plan.requires_decomposition:
+            lookup_term = None
         coverage_descriptor = query_plan.coverage_kind or ""
         coverage_profiles = {"research", "priority", "priority_probe", "qa_research", "qa_focused", "qa_fast"}
         procedure_sensitive = include_base_query and profile in coverage_profiles and "procedure" in coverage_descriptor
@@ -1869,6 +1875,7 @@ class RetrievalEngine:
         routed_boost_ids = [
             item for item in (boost_document_ids or []) if item not in overview_id_set
         ] if self.settings.routed_document_boost_enabled else []
+        priority_document_id_set = set(priority_document_ids or [])
         procedure_truncated = False
         role_truncated = False
         entity_truncated = False
@@ -2169,6 +2176,8 @@ class RetrievalEngine:
                 stage_accumulator["routed_boost_search"] += time.perf_counter() - routed_started
                 for candidate in [*routed_dense_candidates, *routed_lexical_candidates]:
                     candidate.sources.add("routed")
+                    if candidate.document_id in priority_document_id_set:
+                        candidate.sources.add("okf_routed")
 
             if profile == "realtime":
                 sources = (
@@ -2342,9 +2351,12 @@ class RetrievalEngine:
                     table_query_affinity(question, candidate),
                 )
             applicability = applicability_score(query_plan, candidate) if candidate is not None else 0.0
+            okf_bonus = 0.0
             if candidate is not None:
                 candidate.applicability_score = applicability
-            adjusted_scores[chunk_id] = score + bonus + applicability
+                if candidate.document_id in priority_document_id_set and "okf_routed" in candidate.sources:
+                    okf_bonus = max(0.0, float(self.settings.okf_query_fusion_bonus))
+            adjusted_scores[chunk_id] = score + bonus + applicability + okf_bonus
         fused_cap = min(limits["fused"], max(8, self.settings.rerank_prefilter_max_candidates))
         globally_ranked_ids = sorted(
             fused, key=lambda chunk_id: adjusted_scores[chunk_id], reverse=True
@@ -2393,9 +2405,10 @@ class RetrievalEngine:
 
         if self.settings.lane_reservation_enabled and len(reserved_ids) < fused_cap:
             lane_quotas = (
-                (("exact", 2), ("lexical", 4), ("routed", 2), ("governing", 1), ("dense", 1), ("table", 0))
+                (("okf_routed", max(1, self.settings.okf_query_reserve_candidates)), ("exact", 2), ("lexical", 4), ("routed", 2), ("governing", 1), ("dense", 1), ("table", 0))
                 if profile == "realtime"
                 else (
+                    ("okf_routed", max(1, self.settings.okf_query_reserve_candidates)),
                     ("table", self.settings.lane_reserve_table),
                     ("exact", self.settings.lane_reserve_exact),
                     ("governing", self.settings.lane_reserve_governing),
@@ -2440,7 +2453,18 @@ class RetrievalEngine:
         fused_candidates = deduplicate_candidates(fused_candidates)
         definition_fast_path = False
         definition_scores: dict[UUID, float] = {}
-        if query_plan.intent == "definition" and query_plan.lookup_term:
+        isolated_definition_goal = bool(
+            evidence_plan is not None
+            and goal_ids is not None
+            and len(goal_ids) == 1
+            and any(goal.id in goal_ids and goal.kind == "definition" for goal in evidence_plan.goals)
+        )
+        definition_path_allowed = (
+            evidence_plan is None
+            or not evidence_plan.requires_decomposition
+            or isolated_definition_goal
+        )
+        if definition_path_allowed and query_plan.intent == "definition" and query_plan.lookup_term:
             structural_defs = self._definition_candidates(
                 query_plan.lookup_term, user, document_ids, 8, query_plan.source_scope
             )
@@ -2738,7 +2762,12 @@ class RetrievalEngine:
                 final_candidates.append(candidate)
 
         jev_started = time.perf_counter()
-        final_candidates, jev_details = self.jev.judge_and_apply(question, final_candidates)
+        final_candidates, jev_details = self.jev.judge_and_apply(
+            question,
+            final_candidates,
+            evidence_plan=evidence_plan,
+            goal_ids=goal_ids,
+        )
         timings_ms["jev"] = int((time.perf_counter() - jev_started) * 1000)
         if jev_details.get("called"):
             rerank_details = dict(rerank_details or {})

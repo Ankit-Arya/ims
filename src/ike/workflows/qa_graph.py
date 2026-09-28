@@ -20,6 +20,7 @@ from ike.retrieval.query_plan import QueryPlan, build_query_plan
 from ike.retrieval.types import Evidence
 from ike.retrieval.source_policy import SourcePolicy
 from ike.services.llm import LLMClient
+from ike.services.okf_resolver import OKFResolver
 from ike.workflows.answer_planning import AnswerPlan, answer_plan_from_payload
 from ike.workflows.query_frame import QueryFrame, deterministic_query_frame
 from ike.workflows.evidence_planning import (
@@ -77,6 +78,8 @@ class QAState(TypedDict, total=False):
     retrieval_effort: str
     corpus_discovery: dict
     routed_document_ids: list[UUID]
+    okf_document_ids: list[UUID]
+    okf_resolution: dict
     retrieval_trace: dict
     expansions: list[str]
     lookup_term: str | None
@@ -108,6 +111,7 @@ class QAGraphService:
         self.settings = get_settings()
         self.retrieval = RetrievalEngine(db)
         self.llm = LLMClient()
+        self.okf_resolver = OKFResolver(db)
         self.progress = progress
         self.answer_delta = answer_delta
         self.cancel_check = cancel_check
@@ -301,6 +305,24 @@ class QAGraphService:
         retrieval_effort = classify_retrieval_effort(
             state["question"], query_plan, evidence_plan, requested_mode=requested
         )
+
+        okf_document_ids: list[UUID] = []
+        okf_resolution: dict = {"enabled": False, "matches": []}
+        if self.settings.okf_enabled and self.settings.okf_query_enabled:
+            okf_started = time.perf_counter()
+            try:
+                okf_document_ids, okf_resolution = self.okf_resolver.resolve(
+                    state["question"],
+                    self.user,
+                    query_plan,
+                    evidence_plan,
+                    limit=self.settings.okf_query_max_documents,
+                )
+            except Exception:
+                logger.exception("okf_query_resolution_failed")
+                okf_resolution = {"enabled": True, "failed": True, "matches": []}
+            workflow_timings["okf_resolution"] = int((time.perf_counter() - okf_started) * 1000)
+
         workflow_timings["corpus_discovery"] = int((time.perf_counter() - discovery_started) * 1000)
 
         if requested == "research":
@@ -345,9 +367,10 @@ class QAGraphService:
             "source_policy": source_policy,
             "retrieval_effort": retrieval_effort.level,
             "corpus_discovery": corpus_discovery.as_dict(),
-            # Corpus intelligence is a soft relevance prior only.  Likely documents may
-            # receive a bounded boost lane even while the intelligence index is incomplete;
-            # they never replace the global ACL-scoped safety search.
+            "okf_document_ids": okf_document_ids,
+            "okf_resolution": okf_resolution,
+            # Corpus intelligence and OKF are soft relevance priors only. Likely documents
+            # may receive a bounded boost lane; they never replace global ACL-scoped search.
             "routed_document_ids": list(corpus_discovery.document_ids),
             "input_tokens": input_tokens,
             "output_tokens": output_tokens,
@@ -459,6 +482,8 @@ class QAGraphService:
     def _retrieve(self, state: QAState) -> QAState:
         self._checkpoint()
         routed_ids = list(state.get("routed_document_ids") or [])
+        okf_ids = list(state.get("okf_document_ids") or [])
+        combined_routed_ids = list(dict.fromkeys([*okf_ids, *routed_ids]))
         route_limit = (
             self.settings.retrieval_intelligence_documents_max_fast
             if state.get("retrieval_effort") == "fast"
@@ -487,7 +512,7 @@ class QAGraphService:
             )
             if realtime_scope.document_ids:
                 hard_scope_ids = realtime_scope.document_ids
-        boost_ids = None if hard_scope_ids else routed_ids[:route_limit]
+        boost_ids = None if hard_scope_ids else combined_routed_ids[:route_limit]
         effort = state.get("retrieval_effort")
         corpus_term_limit = 1 if effort == "fast" else 2 if effort == "focused" else 4
         corpus_terms = list((state.get("corpus_discovery") or {}).get("terms") or [])[:corpus_term_limit]
@@ -507,16 +532,96 @@ class QAGraphService:
             profile="realtime" if state.get("experience") == "realtime" else qa_profile,
             query_plan=state.get("query_plan"),
             evidence_plan=state.get("evidence_plan"),
+            include_base_query=not (
+                state.get("evidence_plan") is not None
+                and state["evidence_plan"].requires_decomposition
+                and state["evidence_plan"].strategy == "multi_lookup"
+            ),
             boost_document_ids=boost_ids,
+            priority_document_ids=okf_ids,
             source_stage="all",
             request_id=self.request_id,
             progress=self.progress,
             progress_points=(18, 30, 42, 52),
         )
+        okf_targeted_trace: dict = {}
+        okf_id_set = set(okf_ids)
+        okf_hit_items = [
+            item for item in evidence if item.candidate.document_id in okf_id_set
+        ]
+        okf_hit_docs = {item.candidate.document_id for item in okf_hit_items}
+        plan = state.get("evidence_plan")
+        goal_stats = trace.get("goal_stats") or {}
+        weak_shared_goal_coverage = bool(
+            plan
+            and plan.requires_decomposition
+            and plan.strategy == "multi_hop"
+            and any(
+                float(stats.get("max_rerank_score") or 0.0) < 0.45
+                for stats in goal_stats.values()
+                if stats.get("required", True)
+            )
+        )
+        stock_key = "".join(ch.casefold() for ch in str(query_plan.rolling_stock or "") if ch.isalnum())
+        stock_technical_multipart = bool(
+            stock_key
+            and plan
+            and plan.requires_decomposition
+            and any(
+                "".join(ch.casefold() for ch in str(term) if ch.isalnum()) != stock_key
+                for goal in plan.required_goals
+                for term in goal.entity_terms
+            )
+        )
+        okf_targeted_needed = bool(okf_ids and (weak_shared_goal_coverage or stock_technical_multipart) and not hard_scope_ids) or bool(
+            okf_ids
+            and not hard_scope_ids
+            and (
+                len(okf_hit_items) < min(4, max(1, self.settings.okf_query_targeted_reserve))
+                or len(okf_hit_docs) < min(2, len(okf_ids))
+            )
+        )
+        if okf_targeted_needed:
+            targeted_evidence, okf_targeted_trace = self.retrieval.retrieve(
+                state["question"],
+                self.user,
+                okf_ids,
+                [],
+                profile="qa_focused",
+                query_plan=state.get("query_plan"),
+                evidence_plan=state.get("evidence_plan"),
+                priority_document_ids=okf_ids,
+                source_stage="all",
+                request_id=self.request_id,
+                progress=None,
+            )
+            reserve = max(1, self.settings.okf_query_targeted_reserve)
+            merged: list[Evidence] = []
+            seen_chunks: set[UUID] = set()
+            for item in [*targeted_evidence[:reserve], *evidence]:
+                if item.candidate.chunk_id in seen_chunks:
+                    continue
+                if item.candidate.document_id in okf_id_set:
+                    item.candidate.sources.add("okf_reserved")
+                seen_chunks.add(item.candidate.chunk_id)
+                merged.append(item)
+            evidence = merged
+            for index, item in enumerate(evidence, start=1):
+                item.evidence_id = f"E{index}"
+
         trace = dict(trace)
+        trace["okf_targeted_trace"] = okf_targeted_trace
         trace["retrieval_effort"] = state.get("retrieval_effort")
         trace["interactive_research_cross_encoder_enabled"] = self.settings.interactive_research_cross_encoder_enabled
         trace["corpus_discovery"] = state.get("corpus_discovery")
+        trace["okf_resolution"] = state.get("okf_resolution") or {}
+        trace["okf_document_ids"] = [str(item) for item in okf_ids]
+        okf_id_set = set(okf_ids)
+        trace["okf_evidence_hits"] = [
+            str(item.candidate.document_id)
+            for item in evidence
+            if item.candidate.document_id in okf_id_set
+        ]
         trace["hard_scope_document_ids"] = [str(item) for item in (hard_scope_ids or [])]
         trace["routed_document_ids"] = [str(item) for item in (boost_ids or [])]
         trace["routing_is_hard_scope"] = bool(hard_scope_ids)
@@ -670,6 +775,8 @@ class QAGraphService:
     def _retrieve_expanded(self, state: QAState) -> QAState:
         self._checkpoint()
         routed_ids = list(state.get("routed_document_ids") or [])
+        okf_ids = list(state.get("okf_document_ids") or [])
+        combined_routed_ids = list(dict.fromkeys([*okf_ids, *routed_ids]))
         hard_scope_ids = state.get("document_ids")
         named_source_scope_ids: list[UUID] = []
         query_plan = state.get("query_plan") or build_query_plan(state["question"])
@@ -679,7 +786,7 @@ class QAGraphService:
             )
             if named_source_scope_ids:
                 hard_scope_ids = named_source_scope_ids
-        boost_ids = None if hard_scope_ids else routed_ids[: self.settings.retrieval_intelligence_documents_max_focused]
+        boost_ids = None if hard_scope_ids else combined_routed_ids[: self.settings.retrieval_intelligence_documents_max_focused]
         expanded_profile = (
             "research"
             if state.get("requested_mode") == "research"
@@ -694,14 +801,90 @@ class QAGraphService:
             profile=expanded_profile,
             query_plan=state.get("query_plan"),
             evidence_plan=state.get("evidence_plan"),
-            include_base_query=True,
+            include_base_query=not (
+                state.get("evidence_plan") is not None
+                and state["evidence_plan"].requires_decomposition
+                and state["evidence_plan"].strategy == "multi_lookup"
+            ),
             boost_document_ids=boost_ids,
+            priority_document_ids=okf_ids,
             source_stage="all",
             request_id=self.request_id,
             progress=self.progress,
             progress_points=((60, 66, 72, 76) if state["requested_mode"] == "auto" else (32, 44, 56, 66)),
         )
+        okf_id_set = set(okf_ids)
+        prior_okf = [
+            item for item in (state.get("evidence") or [])
+            if item.candidate.document_id in okf_id_set
+            and "okf_reserved" in item.candidate.sources
+        ]
+        okf_targeted_trace: dict = {}
+        expanded_okf_items = [
+            item for item in evidence if item.candidate.document_id in okf_id_set
+        ]
+        expanded_okf_docs = {item.candidate.document_id for item in expanded_okf_items}
+        expanded_goal_stats = trace.get("goal_stats") or {}
+        expanded_plan = state.get("evidence_plan")
+        weak_expanded_goal_coverage = bool(
+            expanded_plan
+            and expanded_plan.requires_decomposition
+            and expanded_plan.strategy == "multi_hop"
+            and any(
+                float(stats.get("max_rerank_score") or 0.0) < 0.45
+                for stats in expanded_goal_stats.values()
+                if stats.get("required", True)
+            )
+        )
+        expanded_okf_thin = bool(
+            okf_ids
+            and not hard_scope_ids
+            and (
+                len(expanded_okf_items) < min(4, max(1, self.settings.okf_query_targeted_reserve))
+                or len(expanded_okf_docs) < min(2, len(okf_ids))
+            )
+        )
+        if expanded_okf_thin and not prior_okf:
+            targeted_evidence, okf_targeted_trace = self.retrieval.retrieve(
+                state["question"],
+                self.user,
+                okf_ids,
+                [],
+                profile="qa_focused",
+                query_plan=state.get("query_plan"),
+                evidence_plan=state.get("evidence_plan"),
+                priority_document_ids=okf_ids,
+                source_stage="all",
+                request_id=self.request_id,
+                progress=None,
+            )
+            reserve = max(1, self.settings.okf_query_targeted_reserve)
+            prior_okf = targeted_evidence[:reserve]
+            for item in prior_okf:
+                item.candidate.sources.add("okf_reserved")
+
+        if prior_okf:
+            merged: list[Evidence] = []
+            seen_chunks: set[UUID] = set()
+            for item in [*prior_okf, *evidence]:
+                if item.candidate.chunk_id in seen_chunks:
+                    continue
+                seen_chunks.add(item.candidate.chunk_id)
+                merged.append(item)
+            evidence = merged
+            for index, item in enumerate(evidence, start=1):
+                item.evidence_id = f"E{index}"
+
         trace = dict(trace)
+        trace["okf_targeted_trace"] = okf_targeted_trace
+        trace["okf_resolution"] = state.get("okf_resolution") or {}
+        trace["okf_document_ids"] = [str(item) for item in okf_ids]
+        okf_id_set = set(okf_ids)
+        trace["okf_evidence_hits"] = [
+            str(item.candidate.document_id)
+            for item in evidence
+            if item.candidate.document_id in okf_id_set
+        ]
         trace["hard_scope_document_ids"] = [str(item) for item in (hard_scope_ids or [])]
         trace["routed_document_ids"] = [str(item) for item in (boost_ids or [])]
         trace["routing_is_hard_scope"] = bool(hard_scope_ids)
@@ -1316,6 +1499,7 @@ class QAGraphService:
                 "Answer supported goals, clearly distinguish contradicted premises, and explicitly mark unresolved required goals instead of silently dropping them. "
                 "A definition of A plus a definition of B does not prove a relationship between A and B. Co-occurrence does not prove causation, override, entitlement, eligibility, sequence, applicability or exception. "
                 "For conditional or multi-hop questions, preserve the exact conditions and causal/temporal links the evidence establishes. Do not turn the user's hypothetical or premise into documentary fact. "
+                "For threshold/category questions with a numeric component count, if the evidence establishes how each component maps to the regulated operational unit and supplies the relevant formation/count plus threshold table, perform the deterministic count or percentage mapping explicitly before deciding applicability. Do not call the category unresolved when all mapping inputs are evidenced; show the short derivation and cite the inputs. "
                 "Cross-document synthesis is allowed only when the cited passages provide compatible rules/facts and the logical join is explicit; if the relationship needed for the join is not established, say that it remains unestablished. "
                 "For calculations, use only evidenced inputs, identify the formula/assumptions, and do not manufacture a missing value. For current/revision questions, do not infer precedence without effective-date/revision/authority evidence. "
                 + (
