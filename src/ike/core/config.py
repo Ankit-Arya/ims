@@ -255,6 +255,9 @@ class Settings(BaseSettings):
     # so arbitrary user wording cannot create unbounded fan-out or CPU reranking work.
     compositional_planning_enabled: bool = True
     compositional_semantic_planning_enabled: bool = True
+    # Even when full semantic planning is disabled, structurally lossy deterministic plans
+    # may receive one bounded semantic repair pass. Troubleshooting/definition paths remain deterministic.
+    compositional_semantic_repair_enabled: bool = True
     query_frame_enabled: bool = True
     # Reserved for the future fan-out/fan-in graph. Keep disabled until each branch uses
     # an independent SQLAlchemy session and tracing proves concurrency is safe.

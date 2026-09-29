@@ -166,8 +166,34 @@ _CONFIRMATION_SUFFIX_RE = re.compile(
 )
 _CONFLICT_RE = re.compile(
     r"\b(?:conflict(?:ing|s|ed)?|contradict(?:ion|ions|ory|s|ed)?|inconsisten(?:t|cy|cies)|"
-    r"differ(?:ent|ence|ences|s|ed)?|disagree(?:ment|ments|s|d)?|which\s+(?:one\s+)?applies|"
-    r"which\s+(?:one\s+)?prevails|takes?\s+precedence|governing\s+version|authoritative\s+version)\b",
+    r"disagree(?:ment|ments|s|d)?|difference\s+between|different\s+(?:rules?|versions?|values?|limits?|instructions?)|"
+    r"which\s+(?:one\s+)?applies|which\s+(?:one\s+)?prevails|takes?\s+precedence|"
+    r"governing\s+version|authoritative\s+version)\b",
+    re.IGNORECASE,
+)
+
+_POLICY_ENTITLEMENT_RE = re.compile(
+    r"\b(?:entitl(?:e|ed|ement|ements)|eligib(?:le|ility)|allowance(?:s)?|reimburse(?:ment|ments|d|able)?|"
+    r"claim(?:s|ing|ed)?|expenses?|benefits?|admissib(?:le|ility)|compensation|fare|lodging|hotel|"
+    r"conveyance|refreshment|overtime|subsid(?:y|ies)|grants?|meal\s+(?:voucher|allowance)s?|"
+    r"compensatory\s+(?:rest|leave)|daily\s+allowance|travel(?:ling)?\s+allowance|"
+    r"pay\s+(?:scale|level)|designation)\b",
+    re.IGNORECASE,
+)
+_POLICY_CONTEXT_RE = re.compile(
+    r"\b(?:official|duty|tour|outstation|meeting|visit|journey|travel|posting|transfer|headquarters?|"
+    r"holiday|sunday|weekend|overtime|extra\s+hours?|working\s+hours?|worked|shift|"
+    r"another\s+(?:city|state|station)|away\s+from)\b",
+    re.IGNORECASE,
+)
+_POLICY_TRAVEL_CONTEXT_RE = re.compile(
+    r"\b(?:official|duty|tour|outstation|meeting|visit|journey|travel|headquarters?|"
+    r"another\s+(?:city|state|station)|away\s+from)\b",
+    re.IGNORECASE,
+)
+_POLICY_SUPPORT_RE = re.compile(
+    r"\b(?:documents?|bills?|receipts?|proof|voucher(?:s)?|submit|submission|process|procedure|"
+    r"how\s+to|what\s+.*\s+need)\b",
     re.IGNORECASE,
 )
 _CORPUS_NEGATIVE_RE = re.compile(
@@ -373,13 +399,28 @@ def _content_tokens(value: str) -> set[str]:
         "for", "from", "how", "i", "if", "in", "is", "it", "of", "on", "or", "the",
         "then", "to", "what", "when", "where", "which", "who", "why", "with", "would",
         "could", "should", "can", "tell", "me", "find", "establish", "documentary", "evidence",
-        "relevant", "this", "part", "users", "user", "request",
+        "relevant", "this", "part", "users", "user", "request", "they", "them", "their", "there",
+        "was", "were", "has", "have", "had", "been", "being", "both", "same", "also", "too",
+        "came", "left", "sent", "provided", "provide", "provides", "needed", "need", "needs",
     }
     return {
         token.casefold()
         for token in _word_tokens(value)
         if token.casefold() not in stop and token.casefold() not in _GENERIC_QUERY_WORDS
     }
+
+
+def _ordered_content_tokens(value: str) -> list[str]:
+    allowed = _content_tokens(value)
+    ordered: list[str] = []
+    seen: set[str] = set()
+    for token in _word_tokens(value):
+        key = token.casefold()
+        if key not in allowed or key in seen:
+            continue
+        seen.add(key)
+        ordered.append(key)
+    return ordered
 
 
 def _normalize_identifier_plurals(value: str) -> str:
@@ -528,6 +569,7 @@ def _shared_context_anchor(question: str, units: list[str]) -> str | None:
     dependent = 0
     for unit in units[1:]:
         lowered = unit.casefold().strip()
+        lowered = re.sub(r"^(?:and|also)\s+", "", lowered)
         if re.match(
             r"^(?:who|when|can\b|should\b|what\s+(?:action|actions|checks|precautions|"
             r"restriction|restrictions|speed|records|refund|reissue|preconditions|steps|duties))",
@@ -558,7 +600,11 @@ def _multipart_goal_kind(fragment: str) -> str:
         return "condition"
     if re.search(r"\bwho\b|\bresponsible\b|\bdut(?:y|ies)\b", lowered):
         return "responsibility"
-    if re.search(r"\bactions?\b|\bwhat\s+(?:shall|should|must|does?)\b|\bprocedure\b|\bsteps?\b", lowered):
+    if re.search(
+        r"\bactions?\b|\bwhat\s+(?:shall|should|must|does?|precautions?|checks?)\b|"
+        r"\bprocedure\b|\bsteps?\b|\bprecautions?\b|\bchecks?\b",
+        lowered,
+    ):
         return "procedure"
     if re.search(r"\bspeed\b|\blimit\b|\brestrictions?\b|\bvalue\b|\brate\b", lowered):
         return "attribute"
@@ -580,7 +626,60 @@ def _build_multipart_plan(question: str, query_plan: QueryPlan) -> EvidencePlan 
         goal_units = units[1:]
 
     goals: list[EvidenceGoal] = []
-    for index, raw_unit in enumerate(goal_units, start=1):
+
+    # A counted technical condition can only be mapped to a threshold if retrieval also
+    # establishes what one counted item represents and the relevant formation/denominator.
+    # Add this once as a prerequisite instead of polluting every requested outcome goal.
+    # The probes remain generic and user-grounded; they do not guess the component's unit.
+    setup_identifiers = _unique(standalone_identifiers(setup or ""))
+    numeric_mapping_goal_id: str | None = None
+    if (
+        anchor
+        and setup
+        and _NUMBER_RE.search(setup)
+        and query_plan.rolling_stock
+        and len(setup_identifiers) >= 2
+    ):
+        combined_setup_entities = " ".join(setup_identifiers)
+        counted_identifier = next(
+            (
+                item for item in setup_identifiers
+                if re.sub(r"[^a-z0-9]", "", item.casefold())
+                != re.sub(r"[^a-z0-9]", "", query_plan.rolling_stock.casefold())
+            ),
+            setup_identifiers[0],
+        )
+        numeric_mapping_goal_id = "g1"
+        goals.append(
+            EvidenceGoal(
+                id=numeric_mapping_goal_id,
+                kind="calculation",
+                question=(
+                    "Establish the documentary mapping and denominator needed to classify "
+                    f"the counted technical items in {setup} against any count or percentage "
+                    "threshold used by the applicable rule."
+                ),
+                search_queries=_unique(
+                    [
+                        f"{counted_identifier} {query_plan.rolling_stock} quantity per car",
+                        f"{query_plan.rolling_stock} train formation cars",
+                        combined_setup_entities,
+                    ],
+                    limit=3,
+                ),
+                entity_terms=setup_identifiers,
+                required=True,
+                qualifiers=[
+                    f"shared_context:{anchor}",
+                    f"inherited_context:{setup}",
+                    "numeric_threshold_mapping",
+                ],
+                coverage_contract="calculation_inputs",
+            )
+        )
+
+    first_outcome_index = 2 if numeric_mapping_goal_id else 1
+    for index, raw_unit in enumerate(goal_units, start=first_outcome_index):
         unit = re.sub(r"^separately\s+", "", raw_unit, flags=re.IGNORECASE).strip()
         kind = _multipart_goal_kind(unit)
         target = unit
@@ -588,6 +687,7 @@ def _build_multipart_plan(question: str, query_plan: QueryPlan) -> EvidencePlan 
             target = f"{unit} in the shared context of {anchor}"
         goal_entities = _unique(standalone_identifiers(target))
         combined_entities = " ".join(goal_entities)
+        compact_goal = " ".join(_ordered_content_tokens(target)[:10])
         coverage = (
             "ordered_procedure" if kind == "procedure"
             else "enumerate_set" if kind == "responsibility"
@@ -606,11 +706,12 @@ def _build_multipart_plan(question: str, query_plan: QueryPlan) -> EvidencePlan 
                 # Keep atomic goal retrieval isolated. The parent question is handled
                 # separately by the retrieval engine when appropriate; attaching it to
                 # every goal causes one broad formulation to be attributed to all goals.
-                search_queries=_unique([_normalize_identifier_plurals(target), combined_entities, unit], limit=3),
+                search_queries=_unique([_normalize_identifier_plurals(target), compact_goal, combined_entities], limit=3),
                 # Keep entities local to the atomic ask. Global entity inheritance
                 # makes identifiers from one independent subquery leak into every goal.
                 entity_terms=goal_entities,
                 required=True,
+                depends_on=[numeric_mapping_goal_id] if numeric_mapping_goal_id else [],
                 qualifiers=qualifiers,
                 coverage_contract=coverage,
             )
@@ -633,6 +734,225 @@ def _build_multipart_plan(question: str, query_plan: QueryPlan) -> EvidencePlan 
     )
 
 
+def _build_policy_entitlement_plan(question: str, query_plan: QueryPlan) -> EvidencePlan | None:
+    """Plan institutional eligibility/benefit/expense questions by information need, not domain."""
+
+    if not _POLICY_ENTITLEMENT_RE.search(question):
+        return None
+
+    tokens = _word_tokens(question)
+    explicit_enumeration = bool(
+        "enumeration" in (query_plan.facets or [])
+        or re.search(r"\b(?:what\s+all|all\s+(?:types?|kinds?|claims?|allowances?|benefits?)|types?|list)\b", question, re.IGNORECASE)
+    )
+    has_context = bool(_POLICY_CONTEXT_RE.search(question) or _CONDITIONAL_RE.search(question))
+    travel_context = bool(_POLICY_TRAVEL_CONTEXT_RE.search(question))
+    has_amount = bool(
+        _SCALAR_LOOKUP_RE.search(question)
+        or _CALC_RE.search(question)
+        or re.search(r"\b(?:pay\s+(?:scales?|levels?)|designations?|grades?|amounts?|rates?|limits?)\b", question, re.IGNORECASE)
+    )
+    has_support = bool(
+        query_plan.intent == "procedure"
+        or _POLICY_SUPPORT_RE.search(question)
+        or re.search(r"\b(?:need\s+to\s+claim|claim\s+bills?|file\s+a\s+claim)\b", question, re.IGNORECASE)
+    )
+    has_calculation = bool(
+        _CALC_RE.search(question)
+        or (
+            re.search(r"\btotal\b", question, re.IGNORECASE)
+            and bool(_NUMBER_RE.search(question))
+        )
+    )
+
+    # Do not turn a short factual mention of an allowance/benefit into a large plan.
+    if not any((explicit_enumeration, has_context, has_amount, has_support, has_calculation)) and len(tokens) < 10:
+        return None
+
+    core_tokens = [
+        token for token in _ordered_content_tokens(question)
+        if token not in {"different", "all", "types", "type", "amount", "amounts"}
+    ][:14]
+    core = " ".join(core_tokens) or question
+
+    # Build a compact, stable policy probe from the user's own policy nouns and explicit
+    # conditions. Long conversational requests often contain locations, dates and filler
+    # that dilute lexical retrieval; this probe keeps the institutional concept while the
+    # original wording remains available as a separate retrieval hypothesis.
+    lowered = question.casefold()
+    policy_heads: list[str] = []
+    for pattern, canonical in (
+        (r"\ballowances?\b", "allowance"),
+        (r"\breimburse(?:ment|ments|d|able)?\b", "reimbursement"),
+        (r"\bclaims?\b|\bclaiming\b", "claim"),
+        (r"\bbenefits?\b", "benefit"),
+        (r"\bcompensation\b", "compensation"),
+        (r"\bconveyance\b", "conveyance"),
+        (r"\brefreshment\b", "refreshment"),
+        (r"\bcompensatory\s+(?:rest|leave)\b", "compensatory rest"),
+        (r"\bovertime\b", "overtime"),
+        (r"\bgrants?\b", "grant"),
+        (r"\bsubsid(?:y|ies)\b", "subsidy"),
+        (r"\bhotel\b|\blodging\b", "hotel"),
+        (r"\bdaily\s+allowance\b", "daily allowance"),
+        (r"\btravel(?:ling)?\b|\bjourney\b|\btour\b", "travel"),
+        (r"\btransfer(?:red|ring)?\b", "transfer"),
+        (r"\bctg\b", "CTG"),
+    ):
+        if re.search(pattern, lowered, re.IGNORECASE) and canonical not in policy_heads:
+            policy_heads.append(canonical)
+    condition_heads = [
+        token
+        for token in _ordered_content_tokens(question)
+        if token in {
+            "official", "tour", "outstation", "meeting", "transfer", "retire", "retirement",
+            "holiday", "sunday", "weekend", "overtime", "shift", "worked",
+            "hotel", "travel", "taxi", "receipt", "receipts", "manager", "designation", "grade",
+            "request",
+        }
+    ]
+    if re.search(r"\bown\s+request\b|\bself[- ]request\b", lowered):
+        condition_heads.append("own request")
+    compact_policy = " ".join(_unique([*policy_heads, *condition_heads], limit=8)).strip()
+    entities = _unique(query_plan.entity_terms)
+    goals: list[EvidenceGoal] = []
+
+    def add_goal(kind: str, goal_question: str, probes: list[str], contract: str, *, depends_on: list[str] | None = None) -> None:
+        goals.append(
+            EvidenceGoal(
+                id=f"g{len(goals) + 1}",
+                kind=kind,
+                question=goal_question,
+                search_queries=_unique(probes, limit=3),
+                entity_terms=entities,
+                required=True,
+                depends_on=list(depends_on or []),
+                coverage_contract=contract,
+            )
+        )
+
+    if has_context:
+        add_goal(
+            "applicability",
+            "Establish the eligibility and applicability conditions for the requested entitlement or reimbursement in the user's stated context.",
+            [
+                (
+                    "official tour travel entitlement applicability"
+                    if travel_context
+                    else f"{compact_policy} eligibility applicability"
+                    if compact_policy
+                    else f"{core} policy eligibility"
+                ),
+                f"{core} eligibility applicability",
+                f"{core} official duty entitlement",
+            ],
+            "conditional_rule",
+        )
+
+    if explicit_enumeration:
+        add_goal(
+            "enumeration",
+            "Identify the documented categories that satisfy the user's requested set; do not substitute similarly named but differently scoped benefits.",
+            [
+                (
+                    "official tour travel lodging daily allowance local conveyance"
+                    if travel_context
+                    else f"{compact_policy} categories rates pay scale"
+                    if compact_policy and has_amount
+                    else f"{compact_policy} categories entitlement"
+                    if compact_policy
+                    else f"{core} benefit reimbursement categories"
+                ),
+                f"{core} categories types",
+                f"{core} entitlement reimbursement",
+            ],
+            "enumerate_set",
+            depends_on=["g1"] if goals else [],
+        )
+
+    if has_amount:
+        add_goal(
+            "attribute",
+            "Establish the applicable rates, limits, amount basis, grade/designation distinctions, and conditions requested by the user.",
+            [
+                (
+                    "official tour daily allowance hotel lodging rates designation pay scale"
+                    if travel_context
+                    else f"{compact_policy} rates limits pay scale designation"
+                    if compact_policy
+                    else f"{core} rates ceilings grade"
+                ),
+                f"{core} rates limits entitlement",
+                f"{core} pay scale designation grade",
+            ],
+            "all_requested_entities",
+            depends_on=[goal.id for goal in goals if goal.kind in {"applicability", "enumeration"}],
+        )
+
+    if has_support:
+        add_goal(
+            "procedure",
+            "Establish the documented claim/submission process and any required bills, receipts, approvals, or supporting proof.",
+            [
+                (
+                    "official tour claim bills receipts approval supporting documents"
+                    if travel_context
+                    else f"{compact_policy} claim receipts approval supporting documents"
+                    if compact_policy
+                    else f"{core} submission supporting documents"
+                ),
+                f"{core} claim process documents",
+                f"{core} bills receipts approval",
+            ],
+            "ordered_procedure",
+            depends_on=[goal.id for goal in goals if goal.kind == "applicability"],
+        )
+
+    if has_calculation:
+        add_goal(
+            "calculation",
+            "Establish every documentary input and rule needed to calculate the requested total; distinguish policy limits from the user's actual expenses.",
+            [
+                (
+                    "official tour daily allowance hotel duration fare calculation"
+                    if travel_context
+                    else f"{compact_policy} rates duration calculation"
+                    if compact_policy
+                    else f"{core} calculation inputs rates duration"
+                ),
+                f"{core} calculation total rate",
+                f"{core} daily allowance duration amount",
+            ],
+            "calculation_inputs",
+            depends_on=[goal.id for goal in goals if goal.kind in {"applicability", "attribute"}],
+        )
+
+    if not goals:
+        return None
+
+    complex_shape = len(goals) >= 3 or (has_calculation and len(tokens) >= 14)
+    strategy = (
+        "multi_hop" if has_calculation or has_support
+        else "enumeration" if explicit_enumeration
+        else "conditional" if has_context
+        else "single"
+    )
+    warnings = ["policy_entitlement_plan"]
+    if complex_shape:
+        warnings.append("semantic_repair_recommended")
+
+    return EvidencePlan(
+        original=question,
+        strategy=strategy,
+        entities=entities,
+        goals=goals,
+        requires_decomposition=len(goals) > 1,
+        needs_research=len(goals) > 1 or query_plan.coverage_sensitive,
+        needs_verification=True,
+        warnings=warnings,
+    )
+
+
 def build_deterministic_evidence_plan(question: str, query_plan: QueryPlan) -> EvidencePlan:
     """Build a safe evidence-requirement plan without domain-specific assumptions.
 
@@ -641,6 +961,10 @@ def build_deterministic_evidence_plan(question: str, query_plan: QueryPlan) -> E
     """
 
     original = re.sub(r"\s+", " ", (query_plan.normalized or question).strip())
+
+    policy_plan = _build_policy_entitlement_plan(original, query_plan)
+    if policy_plan is not None:
+        return policy_plan
 
     # Attribute/limit questions with explicit applicability constraints must remain one
     # constrained evidence goal. Do this before acronym-definition shortcuts.
@@ -1328,11 +1652,44 @@ def should_use_semantic_planner(question: str, query_plan: QueryPlan, plan: Evid
     return False
 
 
+def should_repair_with_semantic_planner(question: str, query_plan: QueryPlan, plan: EvidencePlan) -> bool:
+    """Escalate only when the deterministic shape is too lossy for the user's request."""
+
+    if query_plan.intent in {"troubleshooting", "definition"}:
+        return False
+    if "semantic_repair_recommended" in plan.warnings:
+        return True
+
+    token_count = len(_word_tokens(question))
+    required = plan.required_goals
+    if len(required) > 1:
+        return False
+
+    if _CALC_RE.search(question) and token_count >= 10:
+        return True
+    if len(_clause_fragments(question)) >= 3:
+        return True
+    if (
+        "enumeration" in (query_plan.facets or [])
+        and token_count >= 12
+        and (_POLICY_ENTITLEMENT_RE.search(question) or _POLICY_CONTEXT_RE.search(question))
+    ):
+        return True
+    if (
+        query_plan.intent == "procedure"
+        and token_count >= 16
+        and (_POLICY_SUPPORT_RE.search(question) or _POLICY_CONTEXT_RE.search(question))
+    ):
+        return True
+    return False
+
+
 def semantic_planner_system_prompt(max_goals: int, max_queries_per_goal: int) -> str:
     return (
         "You are an evidence-planning component for an internal-document retrieval system. "
         "Do NOT answer the user's question and do NOT use your own domain knowledge to decide facts. "
         "Decompose the request into atomic evidence requirements that can be independently searched and verified. "
+        "Use the fewest goals that fully cover the explicit asks: normally one goal per requested sub-question or required calculation input group. Do not create extra authority, approval, governance, conflict, or ownership goals unless the user asked for them or they are strictly necessary to validate an explicit condition. "
         "Preserve every explicit acronym, identifier, number, negation, exception, time/revision qualifier, and condition. "
         "Treat the user's premise as a claim to verify when it may be wrong; never assume it is true. "
         "For causal or multi-step scenarios, distinguish evidence for each event/condition, the requested outcome, and any relationship that must be proven. "
@@ -1508,6 +1865,24 @@ def evidence_plan_from_payload(
         fallback.warnings.append("semantic_planner_no_valid_goals")
         return fallback
 
+    if "policy_entitlement_plan" in fallback.warnings:
+        # Semantic repair may paraphrase all probes back into the employee's wording.
+        # Preserve one deterministic institutional-vocabulary bridge per matching goal kind.
+        # These are search-only hypotheses and remain subject to evidence verification.
+        seed_by_kind = {seed.kind: seed for seed in fallback.goals}
+        for goal in goals:
+            seed = seed_by_kind.get(goal.kind)
+            if seed and seed.search_queries:
+                # Deterministic policy plans place the stable institutional-vocabulary
+                # bridge first. Semantic repair may improve decomposition, but it must not
+                # demote that bridge behind conversational paraphrases or routed retrieval
+                # will again search only the user's surface wording.
+                bridge = seed.search_queries[0]
+                goal.search_queries = _unique(
+                    [bridge, *goal.search_queries[:2]],
+                    limit=max_queries_per_goal,
+                )
+
     # Ensure every explicit short identifier from the deterministic plan retains an
     # independently searchable goal. This prevents one planner mistake from recreating the
     # all-terms-at-once failure class for multi-identifier requests.
@@ -1616,7 +1991,18 @@ def plan_query_specs(plan: EvidencePlan, *, goal_ids: set[str] | None = None, ma
     for goal in plan.goals:
         if goal_ids is not None and goal.id not in goal_ids:
             continue
-        queries = _unique([*goal.search_queries, *goal.entity_terms, goal.question], limit=4)
+        probes = list(goal.search_queries)
+        if "policy_entitlement_plan" in plan.warnings and len(probes) >= 2:
+            # The deterministic policy planner already places its stable heading-vocabulary
+            # bridge first. Preserve that order so routed search sees institutional terms
+            # before conversational paraphrases.
+            probes = list(probes)
+        elif len(probes) >= 3:
+            # Under tight query budgets preserve one literal probe plus the most divergent
+            # vocabulary/heading hypothesis before spending budget on a near-paraphrase.
+            probes = [probes[0], probes[-1], *probes[1:-1]]
+        entity_probes = [] if "policy_entitlement_plan" in plan.warnings else list(goal.entity_terms)
+        queries = _unique([*probes, *entity_probes, goal.question], limit=4)
         for query in queries:
             key = query.casefold()
             spec = specs_by_key.get(key)

@@ -38,7 +38,10 @@ def table_metadata_context(candidate: Candidate, *, max_items: int = 12) -> list
     if candidate.content_kind != "table":
         return []
     values = []
-    values.extend(candidate.section_path or [])
+    section_path = list(candidate.section_path or [])
+    # Nearest headings are the strongest table context. Long inherited ancestor chains can
+    # be stale after parser section transitions and must not dominate ranking/generation.
+    values.extend(section_path[-1:] if section_path else [])
     values.extend(_walk(candidate.source_metadata or {}))
     unique: list[str] = []
     seen: set[str] = set()

@@ -301,10 +301,15 @@ class RetrievalEngine:
         scored: list[tuple[float, Candidate]] = []
         for chunk, document, rank_value in self.db.execute(stmt).all():
             candidate = self._candidate(chunk, document)
-            heading = " / ".join(candidate.section_path or [])
+            # Use the nearest headings as navigation signal.  Full ancestor chains can be
+            # stale in long compendia/merged manuals and must not make a child passage look
+            # applicable merely because an unrelated parent heading contains query terms.
+            heading_parts = [item.strip() for item in (candidate.section_path or []) if item.strip()]
+            heading = " / ".join(heading_parts[-2:])
             heading_overlap = token_overlap(query, heading) if heading else 0.0
-            local_overlap = token_overlap(query, (candidate.contextual_text or candidate.text)[:1600])
-            # FTS rank remains the primary signal; hierarchy overlap is a bounded bonus.
+            local_text = candidate.text or candidate.contextual_text or ""
+            local_overlap = token_overlap(query, f"{heading} {local_text[:1600]}")
+            # FTS rank remains the primary signal; local hierarchy overlap is a bounded bonus.
             score = float(rank_value or 0.0) + (1.25 * heading_overlap) + (0.35 * local_overlap)
             candidate.sources.add("section")
             scored.append((score, candidate))
@@ -1875,7 +1880,59 @@ class RetrievalEngine:
         routed_boost_ids = [
             item for item in (boost_document_ids or []) if item not in overview_id_set
         ] if self.settings.routed_document_boost_enabled else []
-        priority_document_id_set = set(priority_document_ids or [])
+        priority_document_id_list = list(priority_document_ids or [])
+        if (
+            evidence_plan is not None
+            and "policy_entitlement_plan" in evidence_plan.warnings
+            and priority_document_id_list
+        ):
+            # Policy/benefit questions often have many superficially similar documents
+            # (claims, payments, allowances). Only the strongest OKF match receives reserved
+            # priority; lower matches remain available through the routed/global lanes.
+            priority_document_id_list = priority_document_id_list[:1]
+        priority_document_id_set = set(priority_document_id_list)
+
+        # Routed/OKF search must cover the information needs, not merely the first N
+        # paraphrases.  Multi-goal questions often place several formulations for g1 first;
+        # a global query-index cap would therefore never search the routed documents for
+        # later required goals (rates, procedure, calculation, etc.).  Reserve the first
+        # routed formulation for each required goal, then spend any remaining bounded budget
+        # on the earliest unused queries.
+        routed_query_indices: set[int] = set()
+        if routed_boost_ids:
+            base_routed_cap = max(1, int(self.settings.routed_search_max_queries))
+            required_goal_order = (
+                [
+                    goal.id
+                    for goal in evidence_plan.goals
+                    if goal.required and (goal_ids is None or goal.id in goal_ids)
+                ]
+                if evidence_plan is not None
+                else []
+            )
+            routed_cap = min(
+                len(queries),
+                max(base_routed_cap, len(required_goal_order)),
+            )
+            required_goal_set = set(required_goal_order)
+            routed_goals_seen: set[str] = set()
+            for query_index, metadata in enumerate(query_metadata):
+                matching = [
+                    goal_id
+                    for goal_id in (metadata.get("goal_ids") or [])
+                    if goal_id in required_goal_set and goal_id not in routed_goals_seen
+                ]
+                if not matching:
+                    continue
+                routed_query_indices.add(query_index)
+                routed_goals_seen.update(matching)
+                if len(routed_query_indices) >= routed_cap:
+                    break
+            for query_index in range(len(queries)):
+                if len(routed_query_indices) >= routed_cap:
+                    break
+                routed_query_indices.add(query_index)
+
         procedure_truncated = False
         role_truncated = False
         entity_truncated = False
@@ -2165,7 +2222,9 @@ class RetrievalEngine:
 
             routed_dense_candidates: list[Candidate] = []
             routed_lexical_candidates: list[Candidate] = []
-            if routed_boost_ids and query_index < max(1, self.settings.routed_search_max_queries):
+            routed_relaxed_candidates: list[Candidate] = []
+            routed_section_candidates: list[Candidate] = []
+            if routed_boost_ids and query_index in routed_query_indices:
                 routed_started = time.perf_counter()
                 routed_dense_candidates = self._dense(
                     query_vector, user, routed_boost_ids, self.settings.routed_dense_top_k
@@ -2173,8 +2232,25 @@ class RetrievalEngine:
                 routed_lexical_candidates = self._lexical(
                     query, user, routed_boost_ids, self.settings.routed_lexical_top_k
                 )
+                # Within a small routed document set, relaxed lexical and heading search
+                # are cheap and often more precise than dense similarity for broad manuals,
+                # compendia and handbooks. Keep these lanes bounded by the routed top-k.
+                routed_relaxed_candidates = self._relaxed_lexical(
+                    query, user, routed_boost_ids, self.settings.routed_lexical_top_k
+                )
+                routed_section_candidates = self._section_navigation_candidates(
+                    query,
+                    user,
+                    routed_boost_ids,
+                    min(self.settings.routed_lexical_top_k, self.settings.section_navigation_top_k),
+                )
                 stage_accumulator["routed_boost_search"] += time.perf_counter() - routed_started
-                for candidate in [*routed_dense_candidates, *routed_lexical_candidates]:
+                for candidate in [
+                    *routed_dense_candidates,
+                    *routed_lexical_candidates,
+                    *routed_relaxed_candidates,
+                    *routed_section_candidates,
+                ]:
                     candidate.sources.add("routed")
                     if candidate.document_id in priority_document_id_set:
                         candidate.sources.add("okf_routed")
@@ -2189,6 +2265,8 @@ class RetrievalEngine:
                     ("table", table_candidates, self.settings.table_retrieval_weight),
                     ("routed_dense", routed_dense_candidates, 0.90),
                     ("routed_lexical", routed_lexical_candidates, 1.55),
+                    ("routed_relaxed", routed_relaxed_candidates, 1.35),
+                    ("routed_section", routed_section_candidates, 1.50),
                 )
             elif profile in {"qa_fast", "qa_focused", "qa_research"}:
                 # Interactive Q&A uses hybrid fusion as the primary ranker. Exact/lexical
@@ -2204,6 +2282,8 @@ class RetrievalEngine:
                     ("table", table_candidates, max(1.05, self.settings.table_retrieval_weight)),
                     ("routed_dense", routed_dense_candidates, 1.00),
                     ("routed_lexical", routed_lexical_candidates, 1.35),
+                    ("routed_relaxed", routed_relaxed_candidates, 1.30),
+                    ("routed_section", routed_section_candidates, 1.45),
                 )
             else:
                 sources = (
@@ -2215,6 +2295,8 @@ class RetrievalEngine:
                     ("table", table_candidates, self.settings.table_retrieval_weight),
                     ("routed_dense", routed_dense_candidates, self.settings.routed_document_boost),
                     ("routed_lexical", routed_lexical_candidates, self.settings.routed_document_boost),
+                    ("routed_relaxed", routed_relaxed_candidates, max(1.0, self.settings.routed_document_boost)),
+                    ("routed_section", routed_section_candidates, max(self.settings.routed_document_boost, self.settings.section_navigation_weight)),
                 )
             for source, candidates, source_weight in sources:
                 key = f"q{query_index}:{source}"
@@ -2224,6 +2306,11 @@ class RetrievalEngine:
                 )
                 for candidate in candidates:
                     existing = pool.setdefault(candidate.chunk_id, candidate)
+                    # The same chunk can arrive through several retrieval lanes. Preserve
+                    # provenance carried by the incoming candidate (for example okf_routed)
+                    # when a global lane inserted the chunk first; otherwise fusion bonuses
+                    # and lane reservations silently disappear.
+                    existing.sources.update(candidate.sources)
                     existing.sources.add(source)
                     if source.startswith("routed_"):
                         existing.sources.add("routed")
@@ -2910,6 +2997,29 @@ class RetrievalEngine:
                 # accidentally drop the strongest matching procedure/definition chunk.
                 section_anchor_evidence = anchors[:6]
                 section_context = self._section_expansion(anchors, user, document_ids)
+        structured_table_context: list[Candidate] = []
+        if evidence_plan is not None and any(
+            goal.required and goal.kind in {"attribute", "enumeration", "calculation"}
+            for goal in evidence_plan.goals
+            if goal_ids is None or goal.id in goal_ids
+        ):
+            structured_table_context = sorted(
+                [
+                    candidate
+                    for candidate in section_context
+                    if candidate.content_kind == "table"
+                    and table_query_affinity(question, candidate) > 0.0
+                ],
+                key=lambda candidate: (
+                    table_query_affinity(question, candidate),
+                    candidate.rerank_score,
+                    -candidate.ordinal,
+                ),
+                reverse=True,
+            )[:4]
+            for candidate in structured_table_context:
+                candidate.sources.add("structured_neighbor_table")
+
         # Overview evidence is intentionally limited: always search it, but only reserve a
         # few relevant passages so generic explanation cannot crowd out operational rules.
         protected_overview = [
@@ -2945,6 +3055,7 @@ class RetrievalEngine:
             protected=(
                 protected_original
                 + protected_goal
+                + structured_table_context
                 + protected_lookup
                 + protected_coverage
                 + protected_role

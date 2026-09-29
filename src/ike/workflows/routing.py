@@ -52,12 +52,18 @@ _FROM_SOURCE_SCOPE_TAIL_RE = re.compile(
     r"\s+\bfrom\s+(?:the\s+)?(?P<source>[A-Za-z0-9][A-Za-z0-9 _./&()-]{1,80})$",
     re.IGNORECASE,
 )
-_SOURCE_LIKE_RE = re.compile(
+_SOURCE_KEYWORD_RE = re.compile(
     r"\b(?:manual|handbook|rule|rules|policy|circular|instruction|sop|otm|swo|mrgr|adm|"
-    r"compendium|document|file|source|guideline|standard|act|regulation|code)\b|"
-    r"^[A-Z][A-Z0-9./_-]{1,15}$",
+    r"compendium|document|file|source|guideline|standard|act|regulation|code)\b",
     re.IGNORECASE,
 )
+_SOURCE_ACRONYM_RE = re.compile(r"^[A-Z][A-Z0-9./_-]{1,15}$")
+
+
+def _looks_like_source_name(value: str) -> bool:
+    if not (1 <= len(value.split()) <= 10):
+        return False
+    return bool(_SOURCE_KEYWORD_RE.search(value) or _SOURCE_ACRONYM_RE.fullmatch(value))
 
 def extract_source_scope(question: str) -> str | None:
     cleaned = re.sub(r"\s+", " ", question.strip().strip("?.! :"))
@@ -67,7 +73,7 @@ def extract_source_scope(question: str) -> str | None:
         # "as per pay scale/designation" and similar qualifiers are applicability clauses,
         # not document names. Only promote a tail to source scope when it looks like a named
         # documentary source (MRGR, ADM, handbook, policy, business rule, etc.).
-        if not (1 <= len(source.split()) <= 10 and _SOURCE_LIKE_RE.search(source)):
+        if not _looks_like_source_name(source):
             return None
         return source
 
@@ -78,7 +84,7 @@ def extract_source_scope(question: str) -> str | None:
     if not match:
         return None
     source = re.sub(r"\s+", " ", match.group("source")).strip(" ,;:-")
-    if not (1 <= len(source.split()) <= 10 and _SOURCE_LIKE_RE.search(source)):
+    if not _looks_like_source_name(source):
         return None
     return source
 

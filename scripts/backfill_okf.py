@@ -8,7 +8,7 @@ from ike.core.config import get_settings
 from ike.db.models import Chunk, Document
 from ike.db.session import SessionLocal
 from ike.services.metadata_enrichment import infer_operational_profile
-from ike.services.okf import write_document_concept
+from ike.services.okf import OKF_VERSION, document_topic_terms, write_document_concept
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("okf_backfill")
@@ -57,8 +57,9 @@ def backfill() -> tuple[int, int]:
                 )
                 metadata["okf"] = {
                     "status": "ready",
-                    "version": "0.2",
+                    "version": OKF_VERSION,
                     "concept_path": str(okf_path),
+                    "topic_terms": document_topic_terms(chunks),
                     "backfilled": True,
                 }
                 document.extra_metadata = metadata

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import re
 from dataclasses import dataclass
 from uuid import UUID
@@ -14,9 +15,14 @@ from ike.workflows.evidence_planning import EvidencePlan
 
 _TOKEN_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*")
 _STOP = {
-    "a","an","and","are","as","at","be","by","for","from","how","i","if","in","is","it",
-    "of","on","or","the","to","what","when","where","which","who","why","with","during",
-    "must","should","can","does","do","all","any","their","this","that","these","those",
+    "a","an","and","are","as","at","be","been","being","by","for","from","how","i","if","in","is","it",
+    "of","on","or","the","to","what","when","where","which","who","whose","why","with","during",
+    "must","should","can","could","would","will","may","does","do","did","done","all","any","their",
+    "this","that","these","those","they","them","there","here","both","each","either","neither","other",
+    "another","same","such","more","most","less","than","then","under","over","above","below","between",
+    "before","after","through","until","upon","about","against","without","within","outside","inside","via",
+    "have","has","had","having","was","were","only","also","own","per","too","very","just","still",
+    "came","left","sent","provided","provide","provides","providing","needed","need","needs","required",
     "establish","documented","documentary","requested","applicable",
 }
 _ROUTING_GENERIC = {
@@ -28,6 +34,16 @@ _ROUTING_GENERIC = {
 _ANCHOR_GENERIC = {
     "due","high","low","train","operation","operating","mode","area","condition","conditions",
     "section","fails","failed","failure","isolated","isolation","open","closed","required","apply",
+}
+_LOW_SIGNAL_TITLE_TERMS = {
+    "claim", "claims", "amount", "amounts", "allowance", "allowances", "entitlement", "entitlements",
+    "different", "meeting", "official", "types", "type", "delhi", "rules", "rule",
+    "bill", "bills", "process", "processing", "payment", "payments", "format", "standard", "required", "total",
+}
+_LOW_SIGNAL_TOPIC_TERMS = {
+    "all", "any", "amount", "amounts", "daily", "date", "day", "days", "details", "different", "duty",
+    "employee", "employees", "grade", "item", "items", "meeting", "month", "official", "other", "per",
+    "process", "required", "section", "staff", "time", "total", "type", "types", "under", "work", "working",
 }
 
 
@@ -92,9 +108,26 @@ def _constraint_topic_anchor(question: str, plan: QueryPlan, evidence_plan: Evid
     return {term for term in terms if term not in removable}
 
 
+def _trusted_plan_terms(evidence_plan: EvidencePlan | None) -> set[str]:
+    """Return bounded routing hints from deterministic plans we construct ourselves.
+
+    Free-form semantic planner prose is deliberately excluded from OKF routing.  The
+    policy/entitlement planner, however, emits a small fixed vocabulary bridge such as
+    "official tour ... daily allowance ... local conveyance".  Those probes are safer
+    and more discriminative than literal layman wording such as "what all can I claim".
+    """
+    if evidence_plan is None or "policy_entitlement_plan" not in evidence_plan.warnings:
+        return set()
+    terms: set[str] = set()
+    for goal in evidence_plan.goals[:6]:
+        if goal.search_queries:
+            terms.update(_tokens(goal.search_queries[0]))
+    return terms
+
+
 def _query_terms(question: str, plan: QueryPlan, evidence_plan: EvidencePlan | None) -> set[str]:
-    # Use literal user wording + deterministic query metadata only. Do not ingest generated
-    # goal prose here; a bad planner must never contaminate OKF routing.
+    # Use literal user wording + deterministic query metadata. Free-form generated goal
+    # prose is excluded; only explicitly trusted deterministic routing hints may augment it.
     values = [
         question,
         plan.topic,
@@ -106,12 +139,15 @@ def _query_terms(question: str, plan: QueryPlan, evidence_plan: EvidencePlan | N
         *plan.scope_terms,
         *plan.entity_terms,
         *plan.exact_terms,
+        *plan.semantic_queries[:8],
     ]
+
     terms: set[str] = set()
     for value in values:
         terms.update(_tokens(value))
     anchors = _shared_anchor(evidence_plan)
-    return (terms - _ROUTING_GENERIC) | anchors
+    trusted = _trusted_plan_terms(evidence_plan)
+    return (terms - _ROUTING_GENERIC) | anchors | (trusted - _ROUTING_GENERIC)
 class OKFResolver:
     """Resolve likely governing/applicable documents from OKF-derived metadata.
 
@@ -137,7 +173,7 @@ class OKFResolver:
             and any(warning == "multipart_independent_subqueries" for warning in evidence_plan.warnings)
             and len(evidence_plan.goals) > 1
         ):
-            per_goal_limit = max(2, min(4, max(1, limit // len(evidence_plan.goals))))
+            per_goal_limit = max(2, min(6, max(1, limit // len(evidence_plan.goals))))
             merged_ids: list[UUID] = []
             merged_matches: list[dict] = []
             seen: set[UUID] = set()
@@ -199,6 +235,25 @@ class OKFResolver:
             Document.lifecycle_status == "active",
         )
         documents = list(self.db.scalars(stmt))
+
+        # Score structural topics by how discriminative they are in the accessible corpus.
+        # A ubiquitous word such as "process" must not outweigh a rarer topic such as
+        # "lodging", "axle", or "flooding" merely because it appears in many headings.
+        topic_sets: list[set[str]] = []
+        for candidate_document in documents:
+            candidate_okf = (candidate_document.extra_metadata or {}).get("okf") or {}
+            if candidate_okf.get("status") != "ready":
+                continue
+            topic_sets.append({
+                str(value).casefold()
+                for value in candidate_okf.get("topic_terms", [])
+                if value
+            })
+        topic_doc_count = max(1, len(topic_sets))
+        topic_df: dict[str, int] = {}
+        for term in terms - _LOW_SIGNAL_TOPIC_TERMS:
+            topic_df[term] = sum(1 for values in topic_sets if _related_hits({term}, values))
+
         superseded_ids = {
             document.supersedes_document_id
             for document in documents
@@ -217,6 +272,7 @@ class OKFResolver:
             authority_tokens = _tokens(document.authority)
             role_tokens = _tokens(document.source_role)
             type_tokens = _tokens(profile.get("document_type"))
+            topic_tokens = {str(value).casefold() for value in okf.get("topic_terms", []) if value}
             title_compact = _canon(f"{document.title} {document.original_filename}")
 
             reasons: list[str] = []
@@ -226,7 +282,7 @@ class OKFResolver:
                 and _canon(query_plan.rolling_stock) in title_compact
             )
 
-            anchor_surface = title_tokens | family_tokens | role_tokens | type_tokens | ({_canon(query_plan.rolling_stock)} if rolling_stock_title_match and query_plan.rolling_stock else set())
+            anchor_surface = title_tokens | family_tokens | role_tokens | type_tokens | topic_tokens | ({_canon(query_plan.rolling_stock)} if rolling_stock_title_match and query_plan.rolling_stock else set())
             anchor_hits = _related_hits(anchors, anchor_surface) if anchors else set()
             if anchors:
                 if anchor_hits:
@@ -237,9 +293,29 @@ class OKFResolver:
                     reasons.append("shared_context_miss")
 
             title_hits = _related_hits(terms, title_tokens)
-            if title_hits:
-                score += min(4.0, 1.35 * len(title_hits))
-                reasons.append("title:" + ",".join(sorted(title_hits)[:5]))
+            strong_title_hits = title_hits - _LOW_SIGNAL_TITLE_TERMS
+            weak_title_hits = title_hits & _LOW_SIGNAL_TITLE_TERMS
+            if strong_title_hits:
+                score += min(4.0, 1.35 * len(strong_title_hits))
+                reasons.append("title:" + ",".join(sorted(strong_title_hits)[:5]))
+            if weak_title_hits:
+                score += min(0.6, 0.2 * len(weak_title_hits))
+                reasons.append("title_weak:" + ",".join(sorted(weak_title_hits)[:5]))
+
+            topic_hits = _related_hits(terms, topic_tokens)
+            strong_topic_hits = topic_hits - _LOW_SIGNAL_TOPIC_TERMS
+            weak_topic_hits = topic_hits & _LOW_SIGNAL_TOPIC_TERMS
+            if strong_topic_hits:
+                topic_score = 0.0
+                for hit in strong_topic_hits:
+                    df = max(1, topic_df.get(hit, 1))
+                    rarity = math.log((topic_doc_count + 1) / (df + 1))
+                    topic_score += 0.45 + min(1.35, 0.30 * rarity)
+                score += min(9.0, topic_score)
+                reasons.append("topics:" + ",".join(sorted(strong_topic_hits)[:8]))
+            if weak_topic_hits:
+                score += min(0.35, 0.07 * len(weak_topic_hits))
+                reasons.append("topics_weak:" + ",".join(sorted(weak_topic_hits)[:6]))
 
             family_hits = terms & family_tokens
             if family_hits:
@@ -298,7 +374,7 @@ class OKFResolver:
             # questions, generic document overlap is insufficient without the scenario anchor.
             # Applicability metadata (line/rolling stock) may boost a relevant document,
             # but cannot make an unrelated document relevant by itself.
-            identity_overlap = bool(anchor_hits or title_hits or family_hits or type_hits or role_hits)
+            identity_overlap = bool(anchor_hits or strong_title_hits or strong_topic_hits or family_hits or type_hits or role_hits)
             anchor_ok = (not anchors) or bool(anchor_hits)
             if score >= 1.0 and identity_overlap and anchor_ok:
                 matches.append(OKFDocumentMatch(document.id, document.title, score, reasons))

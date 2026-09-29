@@ -37,6 +37,7 @@ from ike.workflows.evidence_planning import (
     satisfaction_from_trace,
     semantic_planner_system_prompt,
     semantic_planner_user_prompt,
+    should_repair_with_semantic_planner,
     should_use_semantic_planner,
 )
 from ike.workflows.verification_policy import retrieval_quality_issues, verification_risk
@@ -256,11 +257,18 @@ class QAGraphService:
         output_tokens = state.get("output_tokens", 0)
         workflow_timings = dict(state.get("workflow_timings_ms", {}))
 
+        standard_semantic_planning = bool(
+            self.settings.compositional_semantic_planning_enabled
+            and should_use_semantic_planner(state["question"], query_plan, evidence_plan)
+        )
+        semantic_repair_planning = bool(
+            self.settings.compositional_semantic_repair_enabled
+            and should_repair_with_semantic_planner(state["question"], query_plan, evidence_plan)
+        )
         semantic_planning_requested = bool(
             state.get("experience") != "realtime"
             and self.settings.compositional_planning_enabled
-            and self.settings.compositional_semantic_planning_enabled
-            and should_use_semantic_planner(state["question"], query_plan, evidence_plan)
+            and (standard_semantic_planning or semantic_repair_planning)
         )
         if semantic_planning_requested:
             semantic_started = time.perf_counter()
@@ -573,7 +581,16 @@ class QAGraphService:
                 for term in goal.entity_terms
             )
         )
-        okf_targeted_needed = bool(okf_ids and (weak_shared_goal_coverage or stock_technical_multipart) and not hard_scope_ids) or bool(
+        independent_goal_recovery = bool(
+            plan
+            and plan.requires_decomposition
+            and "multipart_independent_subqueries" in plan.warnings
+        )
+        okf_targeted_needed = bool(
+            okf_ids
+            and (weak_shared_goal_coverage or stock_technical_multipart or independent_goal_recovery)
+            and not hard_scope_ids
+        ) or bool(
             okf_ids
             and not hard_scope_ids
             and (
@@ -582,20 +599,100 @@ class QAGraphService:
             )
         )
         if okf_targeted_needed:
-            targeted_evidence, okf_targeted_trace = self.retrieval.retrieve(
-                state["question"],
-                self.user,
-                okf_ids,
-                [],
-                profile="qa_focused",
-                query_plan=state.get("query_plan"),
-                evidence_plan=state.get("evidence_plan"),
-                priority_document_ids=okf_ids,
-                source_stage="all",
-                request_id=self.request_id,
-                progress=None,
-            )
             reserve = max(1, self.settings.okf_query_targeted_reserve)
+            independent_goals = bool(
+                plan
+                and plan.requires_decomposition
+                and "multipart_independent_subqueries" in plan.warnings
+            )
+            if independent_goals:
+                # Independent subqueries need independent routed recall. A single scoped
+                # retrieval across all routed documents can let one easy goal consume every
+                # reserved slot and starve another goal even when OKF selected the correct
+                # document for it.
+                matches = (state.get("okf_resolution") or {}).get("matches") or []
+                per_goal_targeted: list[Evidence] = []
+                per_goal_trace: dict[str, dict] = {}
+                per_goal_reserve = max(1, reserve // max(1, len(plan.required_goals)))
+                for goal in plan.required_goals:
+                    goal_doc_ids: list[UUID] = []
+                    for match in matches:
+                        if match.get("goal_id") != goal.id or not match.get("document_id"):
+                            continue
+                        try:
+                            document_id = UUID(str(match["document_id"]))
+                        except (TypeError, ValueError):
+                            continue
+                        if document_id not in goal_doc_ids:
+                            goal_doc_ids.append(document_id)
+                    if not goal_doc_ids:
+                        continue
+                    # Probe routed documents in resolver order one at a time. This prevents
+                    # a generic document for the same role/topic from suppressing the most
+                    # specifically routed source inside the goal's own recovery lane.
+                    goal_attempts: list[dict] = []
+                    for document_id in goal_doc_ids[:3]:
+                        goal_evidence, goal_trace = self.retrieval.retrieve(
+                            goal.question,
+                            self.user,
+                            [document_id],
+                            [],
+                            profile="qa_focused",
+                            query_plan=state.get("query_plan"),
+                            evidence_plan=plan,
+                            goal_ids={goal.id},
+                            include_base_query=False,
+                            priority_document_ids=[document_id],
+                            source_stage="all",
+                            request_id=self.request_id,
+                            progress=None,
+                        )
+                        goal_attempts.append({
+                            "document_id": str(document_id),
+                            "trace": goal_trace,
+                            "evidence_count": len(goal_evidence),
+                        })
+                        if goal_evidence:
+                            per_goal_targeted.extend(goal_evidence[:per_goal_reserve])
+                            break
+                    per_goal_trace[goal.id] = {"attempts": goal_attempts}
+
+                # Fill any spare reserve capacity with the normal all-routed scoped pass.
+                targeted_evidence = per_goal_targeted
+                if len(targeted_evidence) < reserve:
+                    global_targeted, global_trace = self.retrieval.retrieve(
+                        state["question"],
+                        self.user,
+                        okf_ids,
+                        [],
+                        profile="qa_focused",
+                        query_plan=state.get("query_plan"),
+                        evidence_plan=plan,
+                        priority_document_ids=okf_ids,
+                        source_stage="all",
+                        request_id=self.request_id,
+                        progress=None,
+                    )
+                    targeted_evidence.extend(global_targeted)
+                    per_goal_trace["_global"] = global_trace
+                okf_targeted_trace = {
+                    "mode": "per_goal",
+                    "goal_traces": per_goal_trace,
+                }
+            else:
+                targeted_evidence, okf_targeted_trace = self.retrieval.retrieve(
+                    state["question"],
+                    self.user,
+                    okf_ids,
+                    [],
+                    profile="qa_focused",
+                    query_plan=state.get("query_plan"),
+                    evidence_plan=state.get("evidence_plan"),
+                    priority_document_ids=okf_ids,
+                    source_stage="all",
+                    request_id=self.request_id,
+                    progress=None,
+                )
             merged: list[Evidence] = []
             seen_chunks: set[UUID] = set()
             for item in [*targeted_evidence[:reserve], *evidence]:
@@ -836,29 +933,122 @@ class QAGraphService:
                 if stats.get("required", True)
             )
         )
+        stock_key = "".join(
+            ch.casefold() for ch in str(query_plan.rolling_stock or "") if ch.isalnum()
+        )
+        expanded_stock_technical_multipart = bool(
+            stock_key
+            and expanded_plan
+            and expanded_plan.requires_decomposition
+            and any(
+                "".join(ch.casefold() for ch in str(term) if ch.isalnum()) != stock_key
+                for goal in expanded_plan.required_goals
+                for term in goal.entity_terms
+            )
+        )
+        expanded_independent_goal_recovery = bool(
+            expanded_plan
+            and expanded_plan.requires_decomposition
+            and "multipart_independent_subqueries" in expanded_plan.warnings
+        )
         expanded_okf_thin = bool(
             okf_ids
             and not hard_scope_ids
             and (
-                len(expanded_okf_items) < min(4, max(1, self.settings.okf_query_targeted_reserve))
+                expanded_independent_goal_recovery
+                or expanded_stock_technical_multipart
+                or weak_expanded_goal_coverage
+                or len(expanded_okf_items) < min(4, max(1, self.settings.okf_query_targeted_reserve))
                 or len(expanded_okf_docs) < min(2, len(okf_ids))
             )
         )
         if expanded_okf_thin and not prior_okf:
-            targeted_evidence, okf_targeted_trace = self.retrieval.retrieve(
-                state["question"],
-                self.user,
-                okf_ids,
-                [],
-                profile="qa_focused",
-                query_plan=state.get("query_plan"),
-                evidence_plan=state.get("evidence_plan"),
-                priority_document_ids=okf_ids,
-                source_stage="all",
-                request_id=self.request_id,
-                progress=None,
-            )
             reserve = max(1, self.settings.okf_query_targeted_reserve)
+            independent_goals = bool(
+                expanded_plan
+                and expanded_plan.requires_decomposition
+                and "multipart_independent_subqueries" in expanded_plan.warnings
+            )
+            if independent_goals:
+                matches = (state.get("okf_resolution") or {}).get("matches") or []
+                per_goal_targeted: list[Evidence] = []
+                per_goal_trace: dict[str, dict] = {}
+                per_goal_reserve = max(1, reserve // max(1, len(expanded_plan.required_goals)))
+                for goal in expanded_plan.required_goals:
+                    goal_doc_ids: list[UUID] = []
+                    for match in matches:
+                        if match.get("goal_id") != goal.id or not match.get("document_id"):
+                            continue
+                        try:
+                            document_id = UUID(str(match["document_id"]))
+                        except (TypeError, ValueError):
+                            continue
+                        if document_id not in goal_doc_ids:
+                            goal_doc_ids.append(document_id)
+                    if not goal_doc_ids:
+                        continue
+                    goal_attempts: list[dict] = []
+                    for document_id in goal_doc_ids[:3]:
+                        goal_evidence, goal_trace = self.retrieval.retrieve(
+                            goal.question,
+                            self.user,
+                            [document_id],
+                            [],
+                            profile="qa_focused",
+                            query_plan=state.get("query_plan"),
+                            evidence_plan=expanded_plan,
+                            goal_ids={goal.id},
+                            include_base_query=False,
+                            priority_document_ids=[document_id],
+                            source_stage="all",
+                            request_id=self.request_id,
+                            progress=None,
+                        )
+                        goal_attempts.append({
+                            "document_id": str(document_id),
+                            "trace": goal_trace,
+                            "evidence_count": len(goal_evidence),
+                        })
+                        if goal_evidence:
+                            per_goal_targeted.extend(goal_evidence[:per_goal_reserve])
+                            break
+                    per_goal_trace[goal.id] = {"attempts": goal_attempts}
+
+                targeted_evidence = per_goal_targeted
+                if len(targeted_evidence) < reserve:
+                    global_targeted, global_trace = self.retrieval.retrieve(
+                        state["question"],
+                        self.user,
+                        okf_ids,
+                        [],
+                        profile="qa_focused",
+                        query_plan=state.get("query_plan"),
+                        evidence_plan=expanded_plan,
+                        priority_document_ids=okf_ids,
+                        source_stage="all",
+                        request_id=self.request_id,
+                        progress=None,
+                    )
+                    targeted_evidence.extend(global_targeted)
+                    per_goal_trace["_global"] = global_trace
+                okf_targeted_trace = {
+                    "mode": "per_goal",
+                    "goal_traces": per_goal_trace,
+                }
+            else:
+                targeted_evidence, okf_targeted_trace = self.retrieval.retrieve(
+                    state["question"],
+                    self.user,
+                    okf_ids,
+                    [],
+                    profile="qa_focused",
+                    query_plan=state.get("query_plan"),
+                    evidence_plan=expanded_plan,
+                    priority_document_ids=okf_ids,
+                    source_stage="all",
+                    request_id=self.request_id,
+                    progress=None,
+                )
             prior_okf = targeted_evidence[:reserve]
             for item in prior_okf:
                 item.candidate.sources.add("okf_reserved")
@@ -1499,9 +1689,10 @@ class QAGraphService:
                 "Answer supported goals, clearly distinguish contradicted premises, and explicitly mark unresolved required goals instead of silently dropping them. "
                 "A definition of A plus a definition of B does not prove a relationship between A and B. Co-occurrence does not prove causation, override, entitlement, eligibility, sequence, applicability or exception. "
                 "For conditional or multi-hop questions, preserve the exact conditions and causal/temporal links the evidence establishes. Do not turn the user's hypothetical or premise into documentary fact. "
-                "For threshold/category questions with a numeric component count, if the evidence establishes how each component maps to the regulated operational unit and supplies the relevant formation/count plus threshold table, perform the deterministic count or percentage mapping explicitly before deciding applicability. Do not call the category unresolved when all mapping inputs are evidenced; show the short derivation and cite the inputs. "
-                "Cross-document synthesis is allowed only when the cited passages provide compatible rules/facts and the logical join is explicit; if the relationship needed for the join is not established, say that it remains unestablished. "
+                "For threshold/category questions with a numeric component count, if the evidence establishes how each component maps to the regulated operational unit and supplies the relevant formation/count plus threshold table, perform the deterministic count or percentage mapping explicitly before deciding applicability. If several documented formation/count variants are possible and every supported variant falls in the same threshold category, state that the result is invariant across those supported variants and use the bounding calculation instead of demanding one exact variant. Do not call the category unresolved when the available mapping inputs are sufficient to prove the category; show the short derivation and cite the inputs. "
+                "Cross-document synthesis is allowed only when the cited passages provide compatible rules/facts and the logical join is explicit; if the relationship needed for the join is not established, say that it remains unestablished. Do not label two instructions as conflicting merely because their outcomes differ: first compare trigger, timing, operating state, location, and applicability. Distinct pre-service/depot, in-service fault, maintenance, emergency, or recovery scenarios should be presented as separate branches when the evidence supports those scopes; call a conflict only when the same applicability conditions genuinely overlap. If the user's wording does not establish which of those materially different states applies, lead with the branch split and the condition for each branch rather than silently choosing one as the direct answer. "
                 "For calculations, use only evidenced inputs, identify the formula/assumptions, and do not manufacture a missing value. For current/revision questions, do not infer precedence without effective-date/revision/authority evidence. "
+                "Treat document titles and section paths as navigation metadata, not standalone proof of applicability. If an inherited/ancestor heading appears narrower or inconsistent with the passage text, do not impose that scope unless the cited passage itself establishes it. "
                 + (
                     f"The following required goals remain unresolved after targeted retrieval: {', '.join(unresolved)}. State those limitations precisely while still answering supported goals. "
                     if unresolved else
@@ -1607,7 +1798,7 @@ class QAGraphService:
             "Evidence marked lane=overview is explanatory/background context only. Evidence marked lane=operational may support procedures/instructions. Never promote overview-only text into an approved operational instruction. "
             "Every factual claim must cite one or more evidence IDs exactly like [E1]. Preserve exact numbers, units, conditions, exceptions, sequence and modality words such as shall/must/may. "
             "Answer in the user's language when practical while preserving official document terminology, identifiers and quoted labels accurately. "
-            "If sources conflict, explain the conflict and use revision/authority metadata only when it genuinely supports preference. If evidence is incomplete, say so precisely rather than inventing completion. "
+            "If sources appear to conflict, first test whether their trigger, timing, operating state, location, or applicability actually overlap. Present scope-distinct instructions as separate conditional branches; only describe a true conflict when the same conditions overlap, and use revision/authority metadata only when it genuinely supports preference. If evidence is incomplete, say so precisely rather than inventing completion. "
             "For procedures, prioritize immediate applicability, prerequisites/authority, ordered actions, completion/restoration, and material exceptions. "
             "Use Markdown tables only when structured comparison is clearer than prose; do not force procedures into tables. "
             "When a table-derived evidence item is terse, use its supplied table title/header/column context to interpret the row. "

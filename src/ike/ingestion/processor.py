@@ -11,7 +11,7 @@ from ike.db.session import SessionLocal
 from ike.ingestion.docling_pipeline import get_docling_pipeline
 from ike.services.inference_client import InferenceClient
 from ike.services.metadata_enrichment import infer_operational_profile
-from ike.services.okf import write_document_concept
+from ike.services.okf import OKF_VERSION, document_topic_terms, write_document_concept
 from ike.services.storage import LocalStorage
 
 logger = logging.getLogger(__name__)
@@ -84,10 +84,10 @@ def process_document(document_id: UUID) -> None:
                     metadata["operational_profile"] = profile
                 try:
                     okf_path = write_document_concept(document, parsed.chunks, profile, settings.okf_bundle_dir)
-                    metadata["okf"] = {"status": "ready", "version": "0.2", "concept_path": str(okf_path)}
+                    metadata["okf"] = {"status": "ready", "version": OKF_VERSION, "concept_path": str(okf_path), "topic_terms": document_topic_terms(parsed.chunks)}
                 except Exception as okf_exc:
                     logger.exception("okf_generation_failed", extra={"document_id": str(document_id)})
-                    metadata["okf"] = {"status": "failed", "version": "0.2", "error": str(okf_exc)[:1000]}
+                    metadata["okf"] = {"status": "failed", "version": OKF_VERSION, "error": str(okf_exc)[:1000]}
                 document.extra_metadata = metadata
             db.commit()
 

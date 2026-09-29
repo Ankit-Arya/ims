@@ -1,11 +1,16 @@
 from __future__ import annotations
 
 import json
+import re
+from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable, Protocol
 
 from ike.db.models import Document
+
+
+OKF_VERSION = "0.3"
 
 
 class ChunkLike(Protocol):
@@ -17,6 +22,67 @@ class ChunkLike(Protocol):
     text: str
     contextual_text: str
     metadata: dict
+
+
+_TOPIC_TOKEN_RE = re.compile(r"[A-Za-z][A-Za-z0-9_-]{2,}")
+_TOPIC_STOP = {
+    # Structural boilerplate / organisation-name noise.
+    "part", "section", "chapter", "annexure", "table", "contents", "page", "pages", "item", "items",
+    "general", "dmrc", "delhi", "metro", "rail", "railway", "corporation", "limited", "ltd",
+    "document", "documents", "procedure", "procedures", "rules", "rule",
+    # Function words and conversational prose are not document topics.
+    "the", "and", "for", "with", "from", "into", "this", "that", "these", "those", "shall", "will",
+    "would", "should", "could", "can", "may", "must", "have", "has", "had", "having", "are", "is",
+    "was", "were", "be", "been", "being", "do", "does", "did", "done", "not", "only", "also",
+    "any", "all", "both", "each", "either", "neither", "other", "another", "same", "such", "more",
+    "most", "less", "than", "then", "there", "here", "where", "when", "which", "what", "who", "whose",
+    "why", "how", "under", "over", "above", "below", "between", "before", "after", "during", "through",
+    "until", "upon", "about", "against", "without", "within", "outside", "inside", "per", "via",
+    "their", "them", "they", "his", "her", "hers", "him", "its", "our", "ours", "your", "yours",
+    "one", "two", "three", "first", "second", "third", "etc", "note", "notes", "details", "date", "time",
+    "year", "years", "month", "months", "day", "days", "provided", "provide", "provides", "providing",
+    "required", "require", "requires", "needed", "need", "needs", "sent", "came", "left", "asked",
+    "question", "questions", "answer", "answers", "yes", "no", "attend", "attended", "attending",
+    "mention", "mentioned", "mentioning", "travelled", "traveled", "back",
+}
+
+
+def document_topic_terms(chunks: Iterable[ChunkLike], *, limit: int = 240) -> list[str]:
+    """Build a compact structural topic index for broad multi-topic documents.
+
+    Headings are strong document-level signals. Table bodies are much noisier: a single
+    mailing list, example row or address table must not turn a place/person/value into a
+    document topic. Table terms are therefore promoted only when they recur across multiple
+    table chunks (or are already supported by a heading).
+    """
+
+    chunks = list(chunks)
+    heading_counts: Counter[str] = Counter()
+    table_chunk_frequency: Counter[str] = Counter()
+
+    for chunk in chunks:
+        for raw in chunk.section_path or []:
+            for match in _TOPIC_TOKEN_RE.finditer(raw):
+                token = match.group(0).casefold().strip("_-")
+                if token not in _TOPIC_STOP:
+                    heading_counts[token] += 4
+
+        if str(chunk.content_kind).casefold() == "table":
+            sample = (chunk.contextual_text or chunk.text or "")[:900]
+            table_terms = {
+                match.group(0).casefold().strip("_-")
+                for match in _TOPIC_TOKEN_RE.finditer(sample)
+                if match.group(0).casefold().strip("_-") not in _TOPIC_STOP
+            }
+            for token in table_terms:
+                table_chunk_frequency[token] += 1
+
+    counts = Counter(heading_counts)
+    for token, frequency in table_chunk_frequency.items():
+        if token in heading_counts or frequency >= 3:
+            counts[token] += min(frequency, 8)
+
+    return [token for token, _count in counts.most_common(max(1, limit))]
 
 
 def _json(value) -> str:
@@ -45,6 +111,7 @@ def _tags(document: Document, profile: dict) -> list[str]:
 
 def render_document_concept(document: Document, chunks: Iterable[ChunkLike], profile: dict) -> str:
     chunks = list(chunks)
+    topic_terms = document_topic_terms(chunks)
     now = _iso_now()
     status = "deprecated" if document.lifecycle_status == "archived" else "stable"
     source = {
@@ -76,6 +143,7 @@ def render_document_concept(document: Document, chunks: Iterable[ChunkLike], pro
         f"ims_effective_from: {_json(document.effective_from.isoformat() if document.effective_from else None)}",
         f"ims_effective_to: {_json(document.effective_to.isoformat() if document.effective_to else None)}",
         f"ims_operational_profile: {_json(profile)}",
+        f"ims_topic_terms: {_json(topic_terms)}",
         "---",
         "",
         "# Source identity",
@@ -128,7 +196,7 @@ def write_document_concept(
     index = bundle_root / "index.md"
     if not index.exists():
         index.write_text(
-            "---\nokf_version: \"0.2\"\n---\n\n"
+            f"---\nokf_version: \"{OKF_VERSION}\"\n---\n\n"
             "# IMS Open Knowledge Format bundle\n\n"
             "Machine-generated IMS document knowledge. Source PDFs remain authoritative.\n",
             encoding="utf-8",
