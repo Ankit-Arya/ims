@@ -16,11 +16,20 @@ class RetrievalEffort:
 _RESEARCH_CONTRACTS = {
     "all_supported_variants",
     "enumerate_set",
-    "all_requested_entities",
     "compare_variants",
     "calculation_inputs",
 }
-_FOCUSED_CONTRACTS = {"ordered_procedure", "conditional_rule", "relationship_proof", "authority_proof", "scalar_with_condition"}
+_FOCUSED_CONTRACTS = {
+    "ordered_procedure",
+    "conditional_rule",
+    "relationship_proof",
+    "authority_proof",
+    "scalar_with_condition",
+    # A single bounded goal can ask for all requested entities/rows without requiring
+    # corpus-wide Research. True multi-entity/comparison strategies still route Research
+    # via the strategy and goal-count checks below.
+    "all_requested_entities",
+}
 
 
 def classify_retrieval_effort(

@@ -17,7 +17,7 @@ from ike.retrieval.realtime_scope import resolve_realtime_recovery_boost, resolv
 from ike.retrieval.context_assembly import assemble_draft_context
 from ike.retrieval.evidence_ledger import monotonic_merge
 from ike.retrieval.query_plan import QueryPlan, build_query_plan
-from ike.retrieval.types import Evidence
+from ike.retrieval.types import Candidate, Evidence
 from ike.retrieval.source_policy import SourcePolicy
 from ike.services.llm import LLMClient
 from ike.services.okf_resolver import OKFResolver
@@ -132,6 +132,35 @@ class QAGraphService:
         timings = dict(state.get("workflow_timings_ms", {}))
         timings[name] = int((time.perf_counter() - started) * 1000)
         return timings
+
+    @staticmethod
+    def _corpus_repair_hints(discovery: dict | None, *, max_hits: int = 12) -> str:
+        """Compact trusted corpus vocabulary for retrieval repair, not answer evidence."""
+        if not isinstance(discovery, dict):
+            return "No corpus-index hints were available."
+        lines: list[str] = []
+        terms = [str(item).strip() for item in (discovery.get("terms") or []) if str(item).strip()]
+        resolved = [
+            str(item).strip()
+            for item in (discovery.get("resolved_terms") or [])
+            if str(item).strip()
+        ]
+        if terms:
+            lines.append("Corpus terminology: " + ", ".join(terms[:20]))
+        if resolved:
+            lines.append("Canonical/fuzzy expansions: " + ", ".join(resolved[:20]))
+        hits = discovery.get("hits") or []
+        if isinstance(hits, list) and hits:
+            lines.append("Potentially relevant document sections:")
+            for raw in hits[:max_hits]:
+                if not isinstance(raw, dict):
+                    continue
+                title = str(raw.get("document_title") or raw.get("filename") or "document").strip()
+                path = [str(item).strip() for item in (raw.get("section_path") or []) if str(item).strip()]
+                label = str(raw.get("label") or "").strip()
+                section = " > ".join(path) or label or "unsectioned"
+                lines.append(f"- {title}: {section}")
+        return ("\n".join(lines) or "No corpus-index hints were available.")[:5000]
 
     def _retrieval_confidence(self, evidence: list[Evidence], trace: dict) -> str:
         if (
@@ -1355,20 +1384,28 @@ class QAGraphService:
             for goal_id in unresolved:
                 expansions[goal_id] = cleaned or [state["question"]]
 
-        if state.get("experience") != "realtime" and not expansions:
-            expansions = recovery_queries_for_goals(evidence_plan, satisfaction)
-
         compact = "\n\n---\n\n".join(
             item.prompt_block()[:1800] for item in state.get("evidence", [])[:12]
         )
-        corpus_hint_text = str(state.get("corpus_discovery") or {})[:5000]
-        repair_context = compact + "\n\nCORPUS-INDEX SEARCH HINTS (not answer evidence):\n" + corpus_hint_text
-
-        explicit_research_recovery = (
-            state.get("experience") != "realtime"
-            and state.get("requested_mode") == "research"
+        corpus_hint_text = self._corpus_repair_hints(state.get("corpus_discovery"))
+        repair_context = (
+            "CORPUS-INDEX SEARCH HINTS (not answer evidence):\n"
+            + corpus_hint_text
+            + "\n\nPREVIOUS RETRIEVAL EVIDENCE (may be partial or wrong-scope):\n"
+            + compact
         )
-        if explicit_research_recovery and not expansions:
+
+        semantic_recovery_attempted = False
+        if (
+            state.get("experience") != "realtime"
+            and self.settings.adaptive_semantic_recovery_enabled
+        ):
+            # The fast path already failed its evidence/quality gate. Spend one bounded
+            # LLM call here to bridge layman wording to terminology actually present in
+            # indexed document/section hints. Generated probes are search hypotheses only
+            # and are filtered for novelty, identifier/number safety and goal constraints.
+            semantic_recovery_attempted = True
+            attempted_queries = list((state.get("retrieval_trace") or {}).get("queries") or [])
             try:
                 payload, result = self.llm.generate_json(
                     system=repair_system_prompt(self.settings.recovery_max_queries_per_goal),
@@ -1376,7 +1413,7 @@ class QAGraphService:
                         state["question"],
                         evidence_plan,
                         satisfaction,
-                        list((state.get("retrieval_trace") or {}).get("queries") or []),
+                        attempted_queries,
                         repair_context,
                     ),
                     strong=False,
@@ -1389,15 +1426,19 @@ class QAGraphService:
                     question=state["question"],
                     plan=evidence_plan,
                     satisfaction=satisfaction,
-                    attempted_queries=list((state.get("retrieval_trace") or {}).get("queries") or []),
+                    attempted_queries=attempted_queries,
                     max_queries_per_goal=self.settings.recovery_max_queries_per_goal,
                     trusted_corpus_text=repair_context,
                 )
             except Exception:
-                logger.exception("broad_retrieval_repair_failed")
+                logger.exception("adaptive_semantic_retrieval_repair_failed")
 
-        if not expansions:
-            expansions = recovery_queries_for_goals(evidence_plan, satisfaction)
+        # Deterministic recovery remains the fail-open fallback and fills any unresolved
+        # goal for which the semantic controller returned no safe/materially novel probe.
+        if state.get("experience") != "realtime":
+            deterministic_expansions = recovery_queries_for_goals(evidence_plan, satisfaction)
+            for goal_id, queries in deterministic_expansions.items():
+                expansions.setdefault(goal_id, queries)
         if quality_issues:
             query_plan = state.get("query_plan") or build_query_plan(state["question"])
             fallback_queries = list(dict.fromkeys([
@@ -1424,6 +1465,128 @@ class QAGraphService:
         recovery_scope_ids = (
             recovery_boost_ids if realtime_recovery and recovery_boost_ids else state.get("document_ids")
         )
+
+        # Enumeration/overview failures inside large handbooks need section diversity, not
+        # merely another document-diverse top-k. Re-run the cheap corpus-section router on
+        # at most a couple of materially new recovery probes. OKF IDs are used only as a
+        # navigation-hint scope here; chunk retrieval below remains globally ACL-scoped.
+        recovery_discovery = state.get("corpus_discovery") or {}
+        enumeration_rediscovery_queries: list[str] = []
+        enumeration_rediscovery_hit_count = 0
+        if (
+            not realtime_recovery
+            and self.settings.adaptive_enumeration_section_rediscovery_enabled
+        ):
+            enum_goal_ids = {
+                goal.id
+                for goal in evidence_plan.goals
+                if goal.id in set(unresolved) and goal.kind in {"enumeration", "overview"}
+            }
+            seen_rediscovery: set[str] = set()
+            for goal_id in unresolved:
+                if goal_id not in enum_goal_ids:
+                    continue
+                for query in expansions.get(goal_id, []):
+                    cleaned = re.sub(r"\s+", " ", str(query or "").strip())
+                    key = cleaned.casefold()
+                    if not cleaned or key in seen_rediscovery:
+                        continue
+                    seen_rediscovery.add(key)
+                    enumeration_rediscovery_queries.append(cleaned)
+                    if len(enumeration_rediscovery_queries) >= self.settings.adaptive_enumeration_section_rediscovery_max_queries:
+                        break
+                if len(enumeration_rediscovery_queries) >= self.settings.adaptive_enumeration_section_rediscovery_max_queries:
+                    break
+
+            if enumeration_rediscovery_queries:
+                hint_scope_ids = state.get("document_ids") or state.get("okf_document_ids") or None
+                rediscovered_hits: list[dict] = []
+                for query in enumeration_rediscovery_queries:
+                    try:
+                        discovery = self.retrieval.discover_corpus(query, self.user, hint_scope_ids)
+                        rediscovered_hits.extend(discovery.as_dict().get("hits") or [])
+                    except Exception:
+                        logger.exception("enumeration_section_rediscovery_failed")
+                enumeration_rediscovery_hit_count = len(rediscovered_hits)
+                if rediscovered_hits:
+                    base = dict(recovery_discovery) if isinstance(recovery_discovery, dict) else {}
+                    combined: list[dict] = []
+                    seen_hits: set[str] = set()
+                    for hit in [*rediscovered_hits, *(base.get("hits") or [])]:
+                        if not isinstance(hit, dict):
+                            continue
+                        key = str(hit.get("node_id") or "") or "|".join(
+                            [
+                                str(hit.get("document_id") or ""),
+                                str(hit.get("node_type") or ""),
+                                ">".join(str(x) for x in (hit.get("section_path") or [])),
+                            ]
+                        )
+                        if key in seen_hits:
+                            continue
+                        seen_hits.add(key)
+                        combined.append(hit)
+                    base["hits"] = combined
+                    base["available"] = bool(combined)
+                    recovery_discovery = base
+
+        # A semantic partial result is stronger guidance than another global query:
+        # the auditor names the evidence that already contains part of the answer.
+        # Expand those anchors inside their logical sections so continuation pages/tables
+        # can enter the recovery ledger before lower-signal global recovery hits.
+        evidence_by_id = {
+            item.evidence_id.upper(): item for item in state.get("evidence", [])
+        }
+        partial_goal_ids = set(satisfaction.partial_goal_ids) & set(unresolved)
+        partial_anchors: list[Candidate] = []
+        partial_anchor_ids: list[str] = []
+        seen_partial_chunks: set[UUID] = set()
+        for status in satisfaction.statuses:
+            if status.goal_id not in partial_goal_ids or status.status != "partial":
+                continue
+            for evidence_id in status.evidence_ids:
+                item = evidence_by_id.get(str(evidence_id).upper())
+                if item is None or item.candidate.chunk_id in seen_partial_chunks:
+                    continue
+                item.candidate.sources.add(f"goal:{status.goal_id}")
+                partial_anchors.append(item.candidate)
+                partial_anchor_ids.append(item.evidence_id)
+                seen_partial_chunks.add(item.candidate.chunk_id)
+
+        partial_section_candidates = (
+            self.retrieval.expand_partial_goal_context(
+                partial_anchors,
+                self.user,
+                recovery_scope_ids,
+            )
+            if partial_anchors
+            else []
+        )
+        partial_section_evidence = [
+            Evidence(evidence_id=f"R{i}", candidate=candidate)
+            for i, candidate in enumerate(partial_section_candidates, 1)
+        ]
+
+        # If the first pass latched onto a semantically related but narrower section,
+        # query rewriting alone can inherit that wrong scope. Admit a bounded first/last-
+        # chunk sample from independently ranked corpus sections as a second recovery lane.
+        # Enumeration may use the bounded re-discovery above; other goals reuse first-pass
+        # section hints with no extra embedding call.
+        corpus_section_candidates = (
+            self.retrieval.recover_corpus_section_context(
+                recovery_discovery,
+                self.user,
+                recovery_scope_ids,
+                goal_ids=set(unresolved),
+            )
+            if not realtime_recovery
+            else []
+        )
+        corpus_section_evidence = [
+            Evidence(evidence_id=f"C{i}", candidate=candidate)
+            for i, candidate in enumerate(corpus_section_candidates, 1)
+        ]
+
         recovered, recovery_trace = self.retrieval.retrieve(
             state["question"],
             self.user,
@@ -1442,18 +1605,23 @@ class QAGraphService:
             evidence_plan=evidence_plan,
             goal_ids=set(unresolved),
             goal_expansions=expansions,
-            include_base_query=not realtime_recovery,
+            # Recovery must be an independent search pass. Re-including the raw question
+            # or failed seed formulations can recreate the same ranking error that caused
+            # the evidence gap. Every unresolved goal already has a safe semantic or
+            # deterministic fail-open expansion above.
+            include_base_query=False,
             boost_document_ids=(None if recovery_scope_ids else (recovery_boost_ids or None)),
             request_id=self.request_id,
             progress=self.progress,
             progress_points=(75, 78, 81, 83),
         )
 
+        recovered_with_section = [*partial_section_evidence, *corpus_section_evidence, *recovered]
         if state.get("experience") == "realtime":
             # Recovery ran because the scoped first pass was weak. Let broadened evidence
             # lead the merge instead of allowing the known-bad first pass to dominate.
             merged = self._merge_evidence(
-                recovered,
+                recovered_with_section,
                 state.get("evidence", []),
                 limit=min(12, self.settings.compositional_max_evidence_k),
                 evidence_plan=evidence_plan,
@@ -1462,7 +1630,7 @@ class QAGraphService:
         else:
             merged = self._merge_evidence(
                 state.get("evidence", []),
-                recovered,
+                recovered_with_section,
                 limit=self.settings.compositional_max_evidence_k,
                 evidence_plan=evidence_plan,
                 satisfaction=satisfaction,
@@ -1488,6 +1656,19 @@ class QAGraphService:
             "fused_candidates": recovery_trace.get("fused_candidates", 0),
             "reranked_candidates": recovery_trace.get("reranked_candidates", 0),
             "goal_stats": recovery_trace.get("goal_stats", {}),
+            "semantic_recovery_attempted": semantic_recovery_attempted,
+            "semantic_recovery_query_count": sum(len(items) for items in expansions.values()),
+            "enumeration_section_rediscovery_queries": enumeration_rediscovery_queries,
+            "enumeration_section_rediscovery_hit_count": enumeration_rediscovery_hit_count,
+            "partial_section_anchor_evidence_ids": partial_anchor_ids,
+            "partial_section_candidate_count": len(partial_section_evidence),
+            "partial_section_pages": [
+                item.candidate.page_from for item in partial_section_evidence
+            ],
+            "corpus_section_candidate_count": len(corpus_section_evidence),
+            "corpus_section_pages": [
+                item.candidate.page_from for item in corpus_section_evidence
+            ],
             "timings_ms": recovery_trace.get("timings_ms", {}),
             "total_ms": recovery_trace.get("total_ms", 0),
         }
@@ -1536,6 +1717,19 @@ class QAGraphService:
             trace["draft_context"] = draft_trace
         else:
             trace = state.get("retrieval_trace", {})
+
+        # Auto mode may broaden retrieval to research-level coverage, but the evidence plan
+        # already supplies structure for synthesis. Reserve the extra answer-planning LLM
+        # call for users who explicitly selected Research; this removes a sequential network
+        # round-trip from interactive Auto queries without changing retrieval or verification.
+        if state.get("requested_mode") != "research":
+            return {
+                "answer_plan": AnswerPlan(),
+                "draft_evidence": evidence,
+                "retrieval_trace": trace,
+                "workflow_timings_ms": self._timing_update(state, "answer_plan_skipped_auto_research", started),
+            }
+
         query_plan = state.get("query_plan") or build_query_plan(state["question"])
         evidence_plan = state.get("evidence_plan")
         complex_plan_needed = (
@@ -1630,9 +1824,9 @@ class QAGraphService:
             "answer",
             "Writing the evidence-grounded answer",
             (
-                "Using the stronger research model over the broadened evidence set and response plan."
+                "Using the broadened research evidence set and response plan."
                 if state["resolved_mode"] == "research"
-                else "Using the faster answer model while still adding materially useful context supported by the evidence."
+                else "Using the bounded answer path while still adding materially useful context supported by the evidence."
             ),
             80,
         )
@@ -1687,6 +1881,7 @@ class QAGraphService:
             compositional_instruction = (
                 "This request has an explicit evidence plan. Treat every required evidence goal as an independent obligation; one highly relevant passage cannot satisfy another goal. "
                 "Answer supported goals, clearly distinguish contradicted premises, and explicitly mark unresolved required goals instead of silently dropping them. "
+                "For multipart or independent subqueries, answer each goal from the most explicit evidence available for that goal; do not replace a documented mechanism, path, named component, qualifier, unit, frequency, threshold, or condition with a broader but less informative summary when the specific evidence is already supplied. "
                 "A definition of A plus a definition of B does not prove a relationship between A and B. Co-occurrence does not prove causation, override, entitlement, eligibility, sequence, applicability or exception. "
                 "For conditional or multi-hop questions, preserve the exact conditions and causal/temporal links the evidence establishes. Do not turn the user's hypothetical or premise into documentary fact. "
                 "For threshold/category questions with a numeric component count, if the evidence establishes how each component maps to the regulated operational unit and supplies the relevant formation/count plus threshold table, perform the deterministic count or percentage mapping explicitly before deciding applicability. If several documented formation/count variants are possible and every supported variant falls in the same threshold category, state that the result is invariant across those supported variants and use the bounding calculation instead of demanding one exact variant. Do not call the category unresolved when the available mapping inputs are sufficient to prove the category; show the short derivation and cite the inputs. "
@@ -1749,6 +1944,9 @@ class QAGraphService:
         if "enumeration" in (query_plan.facets or []):
             helpful_instruction = (
                 "For a list/enumeration request, answer the requested list first and keep related context tightly bounded. "
+                "When the evidence includes an index, table of contents, directory, or category headings that identify additional requested items but does not include their operative values, enumerate those items in a clearly labeled 'identified but value/details not established in the retrieved evidence' group instead of silently omitting them. "
+                "Distinguish materially different documented scopes (for example allowance, reimbursement, subsidy, benefit, procedure, or travel entitlement) rather than flattening them into one homogeneous category. "
+                "Never invent a rate, condition, or applicability rule for an index-only item. "
                 "Do not add operating hours, permissions, procedures, matrices, or incidental mentions merely because they contain the same nouns; include such material only when it directly identifies, qualifies, or disambiguates an item in the requested list. "
             )
         elif self.settings.helpful_context_mode == "off":
@@ -1821,7 +2019,14 @@ class QAGraphService:
             f"Answer plan:\n{plan_instruction}\n\nEvidence:\n{evidence_text}\n\n"
             "Produce the most useful complete answer justified by the evidence. Answer every supported required goal and explicitly scope any unresolved part. The user may have asked only a short/generic question, so include materially relevant context that helps them understand what matters next without introducing unsupported facts."
         )
-        strong = state["resolved_mode"] == "research" and state.get("experience") != "realtime"
+        strong = bool(
+            state.get("experience") != "realtime"
+            and state["resolved_mode"] == "research"
+            and (
+                state.get("requested_mode") == "research"
+                or self.settings.auto_research_strong_answer_enabled
+            )
+        )
         result = self.llm.generate(
             system=system,
             user=user_prompt,
@@ -1999,24 +2204,130 @@ class QAGraphService:
         issues = "\n".join(f"- {item}" for item in state.get("verification_issues", []) if item) or "- Repair citation integrity."
         evidence_plan = state.get("evidence_plan")
         goal_satisfaction = state.get("goal_satisfaction")
+        valid_ids = {item.evidence_id for item in evidence}
+        allowed_ids = ", ".join(
+            sorted(valid_ids, key=lambda value: int(value[1:]) if value[1:].isdigit() else value)
+        )
         result = self.llm.generate(
             system=(
                 "You are repairing an evidence-grounded technical answer. Apply ONLY the supplied verifier issues. Preserve good organization, headings, tables, ordering, scenario distinctions and tone unless an issue requires a local change. "
-                "Use only supplied evidence. Every factual claim must use valid [E#] citations. For compositional requests, keep every required evidence goal visible and never repair a missing relationship by inventing one. Do not flatten the answer into a generic bullet list."
+                "Use only supplied evidence. Every factual claim must use valid [E#] citations. "
+                f"The ONLY allowed citation IDs are: {allowed_ids}. Never create, increment, guess, or cite an ID outside this whitelist. "
+                "For compositional requests, keep every required evidence goal visible and never repair a missing relationship by inventing one. Do not flatten the answer into a generic bullet list."
             ),
             user=(
                 f"Question:\n{state['question']}\n\n"
                 f"Evidence requirements:\n{evidence_plan.prompt_block() if evidence_plan else 'No compositional evidence plan.'}\n\n"
                 f"Goal audit:\n{goal_satisfaction.prompt_block() if goal_satisfaction else 'Not separately assessed.'}\n\n"
+                f"Allowed citation IDs:\n{allowed_ids}\n\n"
                 f"Draft to repair:\n{state['answer']}\n\nVerifier issues:\n{issues}\n\nEvidence:\n{evidence_text}\n\n"
                 "Return the complete repaired answer only."
             ),
-            strong=True,
-            max_output_tokens=self.settings.llm_max_output_tokens,
+            # Verification already supplies bounded, evidence-specific corrections;
+            # use the fast model for the rewrite instead of paying a second strong-model
+            # generation cost after the primary answer has already been reasoned through.
+            strong=False,
+            max_output_tokens=min(self.settings.llm_max_output_tokens, 5000),
         )
+        repair_input_tokens = result.input_tokens
+        repair_output_tokens = result.output_tokens
         cited = list(dict.fromkeys(_CITATION_RE.findall(result.text)))
-        valid_ids = {item.evidence_id for item in evidence}
         citation_integrity = bool(cited) and all(citation_id in valid_ids for citation_id in cited)
+        correction_result = None
+        trace = dict(state.get("retrieval_trace", {}))
+        if not citation_integrity:
+            invalid_ids = [citation_id for citation_id in cited if citation_id not in valid_ids]
+            logger.warning(
+                "citation_integrity_retry_after_targeted_repair",
+                extra={"invalid_citation_ids": invalid_ids},
+            )
+            trace["citation_repair_retry"] = True
+            trace["citation_repair_invalid_ids"] = invalid_ids
+            correction_result = self.llm.generate(
+                system=(
+                    "You are performing a citation-only correction on an evidence-grounded answer. "
+                    "Preserve the prose, organization, values, caveats and verifier corrections. "
+                    "Change only citations, except that a claim with no supporting supplied evidence must be removed rather than given a guessed citation. "
+                    f"The ONLY allowed citation IDs are: {allowed_ids}. Never invent any other [E#] ID."
+                ),
+                user=(
+                    f"Question:\n{state['question']}\n\n"
+                    f"Allowed citation IDs:\n{allowed_ids}\n\n"
+                    f"Answer needing citation correction:\n{result.text}\n\n"
+                    f"Evidence:\n{evidence_text}\n\n"
+                    "Return the complete corrected answer only."
+                ),
+                strong=False,
+                max_output_tokens=min(self.settings.llm_max_output_tokens, 5000),
+            )
+            cited = list(dict.fromkeys(_CITATION_RE.findall(correction_result.text)))
+            citation_integrity = bool(cited) and all(
+                citation_id in valid_ids for citation_id in cited
+            )
+            if citation_integrity:
+                result = correction_result
+                trace["citation_repair_retry_succeeded"] = True
+            else:
+                trace["citation_repair_retry_succeeded"] = False
+
+        # Rare fail-safe: some fast-model verification rewrites preserve the prose but
+        # drop every citation. Do not publish that answer, but also do not throw away good
+        # retrieved evidence. One final bounded strong-model rewrite is allowed only after
+        # both normal repair attempts fail. Keep its evidence context compact by prioritizing
+        # evidence already cited by the original draft, then filling from the assembled set.
+        strong_citation_result = None
+        if not citation_integrity and evidence:
+            original_cited = [
+                citation_id
+                for citation_id in dict.fromkeys(_CITATION_RE.findall(state.get("answer", "")))
+                if citation_id in valid_ids
+            ]
+            evidence_by_id = {item.evidence_id: item for item in evidence}
+            compact_items = [evidence_by_id[citation_id] for citation_id in original_cited]
+            seen_compact = {item.evidence_id for item in compact_items}
+            for item in evidence:
+                if item.evidence_id in seen_compact:
+                    continue
+                compact_items.append(item)
+                seen_compact.add(item.evidence_id)
+                if len(compact_items) >= 14:
+                    break
+            compact_evidence_text = "\n\n---\n\n".join(
+                item.prompt_block() for item in compact_items
+            )
+            trace["citation_repair_strong_fallback"] = True
+            strong_citation_result = self.llm.generate(
+                system=(
+                    "You are the final citation-integrity repair for an evidence-grounded answer. "
+                    "Produce a complete useful answer, but use ONLY the supplied evidence. "
+                    "Every factual paragraph or table row must carry at least one valid [E#] citation. "
+                    f"The ONLY allowed citation IDs are: {allowed_ids}. "
+                    "Never invent a citation ID. If a claim is not supported, omit it or state the missing input/evidence."
+                ),
+                user=(
+                    f"Question:\n{state['question']}\n\n"
+                    f"Answer that failed citation repair:\n{(correction_result.text if correction_result is not None else result.text)}\n\n"
+                    f"Verifier issues:\n{issues}\n\n"
+                    f"Evidence:\n{compact_evidence_text}\n\n"
+                    "Return the complete corrected answer only, with valid [E#] citations."
+                ),
+                strong=True,
+                max_output_tokens=min(self.settings.llm_max_output_tokens, 4500),
+            )
+            strong_cited = list(dict.fromkeys(_CITATION_RE.findall(strong_citation_result.text)))
+            strong_integrity = bool(strong_cited) and all(
+                citation_id in valid_ids for citation_id in strong_cited
+            )
+            trace["citation_repair_strong_fallback_succeeded"] = strong_integrity
+            if strong_integrity:
+                result = strong_citation_result
+                cited = strong_cited
+                citation_integrity = True
+
+        extra_input = correction_result.input_tokens if correction_result is not None else 0
+        extra_output = correction_result.output_tokens if correction_result is not None else 0
+        strong_extra_input = strong_citation_result.input_tokens if strong_citation_result is not None else 0
+        strong_extra_output = strong_citation_result.output_tokens if strong_citation_result is not None else 0
         if not citation_integrity:
             logger.error("citation_integrity_failed_after_targeted_repair")
             return {
@@ -2028,8 +2339,9 @@ class QAGraphService:
                 "verified": False,
                 "citation_integrity": False,
                 "confidence": "low",
-                "input_tokens": state.get("input_tokens", 0) + result.input_tokens,
-                "output_tokens": state.get("output_tokens", 0) + result.output_tokens,
+                "retrieval_trace": trace,
+                "input_tokens": state.get("input_tokens", 0) + repair_input_tokens + extra_input + strong_extra_input,
+                "output_tokens": state.get("output_tokens", 0) + repair_output_tokens + extra_output + strong_extra_output,
                 "workflow_timings_ms": self._timing_update(state, "repair", started),
             }
         return {
@@ -2037,7 +2349,8 @@ class QAGraphService:
             "cited_ids": cited,
             "verified": True,
             "citation_integrity": True,
-            "input_tokens": state.get("input_tokens", 0) + result.input_tokens,
-            "output_tokens": state.get("output_tokens", 0) + result.output_tokens,
+            "retrieval_trace": trace,
+            "input_tokens": state.get("input_tokens", 0) + repair_input_tokens + extra_input + strong_extra_input,
+            "output_tokens": state.get("output_tokens", 0) + repair_output_tokens + extra_output + strong_extra_output,
             "workflow_timings_ms": self._timing_update(state, "repair", started),
         }

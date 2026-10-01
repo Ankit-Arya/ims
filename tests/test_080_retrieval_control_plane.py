@@ -172,15 +172,126 @@ def test_repair_controller_allows_conceptual_search_terms_but_blocks_invented_id
     prompt = repair_system_prompt(4).casefold()
     assert "change the retrieval relation" in prompt
     assert "search-only" in prompt
+    assert "potentially incomplete or wrong-scope" in prompt
+    assert "scope-neutral" in prompt
 
 
-def test_recovery_probes_are_admitted_before_seed_queries_when_base_is_suppressed():
-    source = Path("src/ike/retrieval/engine.py").read_text()
+def test_repair_can_bridge_layman_wording_to_trusted_corpus_terminology():
+    question = "How much room rent can I claim?"
+    plan = EvidencePlan(
+        original=question,
+        goals=[
+            EvidenceGoal(
+                id="g1",
+                kind="attribute",
+                question="Establish the applicable amount or ceiling.",
+                search_queries=["room rent claim amount"],
+                required=True,
+            )
+        ],
+    )
+    satisfaction = GoalSatisfaction(
+        complete=False,
+        statuses=[GoalStatus(goal_id="g1", status="missing")],
+        missing_goal_ids=["g1"],
+    )
+    payload = {
+        "goals": [
+            {
+                "goal_id": "g1",
+                "queries": ["TA DA lodging charges grade city category"],
+            }
+        ]
+    }
+    trusted = (
+        "HR Compendium > TRAVELLING ALLOWANCE / DAILY ALLOWANCE (TA/DA) > "
+        "Compensation for Stay > Lodging Charges"
+    )
+    repaired = repair_queries_from_payload(
+        payload,
+        question=question,
+        plan=plan,
+        satisfaction=satisfaction,
+        attempted_queries=["room rent claim amount"],
+        max_queries_per_goal=3,
+        trusted_corpus_text=trusted,
+    )
+    assert repaired == {"g1": ["TA DA lodging charges grade city category"]}
+
+
+def test_adaptive_recovery_uses_corpus_hints_before_deterministic_fallback():
+    source = Path("src/ike/workflows/qa_graph.py").read_text()
+    semantic_guard = "and self.settings.adaptive_semantic_recovery_enabled"
+    deterministic_fallback = "deterministic_expansions = recovery_queries_for_goals"
+    assert semantic_guard in source
+    assert "self._corpus_repair_hints(state.get(\"corpus_discovery\"))" in source
+    assert source.index(semantic_guard) < source.index(deterministic_fallback)
+
+
+def test_failed_query_recovery_has_independent_corpus_section_lane():
+    graph_source = Path("src/ike/workflows/qa_graph.py").read_text()
+    engine_source = Path("src/ike/retrieval/engine.py").read_text()
+
+    assert "recover_corpus_section_context" in graph_source
+    assert "corpus_section_evidence" in graph_source
+    assert "recovered_with_section = [*partial_section_evidence, *corpus_section_evidence, *recovered]" in graph_source
+    assert "First/last chunks preserve both section framing" in engine_source
+    assert "candidate.sources.add(\"corpus_section_recovery\")" in engine_source
+    assert "adaptive_enumeration_section_rediscovery_enabled" in graph_source
+    assert "enumeration_section_rediscovery_queries" in graph_source
+    assert 'goal.kind in {"enumeration", "overview"}' in graph_source
+
+
+def test_recovery_probes_replace_failed_seed_queries_when_base_is_suppressed():
+    engine_source = Path("src/ike/retrieval/engine.py").read_text()
+    graph_source = Path("src/ike/workflows/qa_graph.py").read_text()
     repair_guard = "if goal_expansions and not include_base_query:"
-    seed_loop = "for spec in goal_specs:"
-    assert repair_guard in source
-    assert source.index(repair_guard) < source.index(seed_loop)
-    assert "only changed retrieval strategy" in source
+    seed_else = "else:\n                for spec in goal_specs:"
+    assert repair_guard in engine_source
+    assert seed_else in engine_source
+    assert "Recovery is a strategy change" in engine_source
+    assert "include_base_query=False" in graph_source
+
+
+def test_auto_research_keeps_fast_answer_model_and_skips_extra_answer_planner():
+    source = Path("src/ike/workflows/qa_graph.py").read_text()
+    assert 'state.get("requested_mode") == "research"' in source
+    assert "self.settings.auto_research_strong_answer_enabled" in source
+    assert 'state.get("requested_mode") != "research"' in source
+    assert "answer_plan_skipped_auto_research" in source
+
+
+def test_enumeration_answers_preserve_index_only_categories_without_inventing_values():
+    source = Path("src/ike/workflows/qa_graph.py").read_text()
+    assert "identified but value/details not established in the retrieved evidence" in source
+    assert "Never invent a rate, condition, or applicability rule for an index-only item" in source
+    assert "Distinguish materially different documented scopes" in source
+
+
+def test_targeted_answer_repair_uses_citation_whitelist_and_safe_retry():
+    source = Path("src/ike/workflows/qa_graph.py").read_text()
+    assert "The ONLY allowed citation IDs are:" in source
+    assert "citation-only correction" in source
+    assert 'trace["citation_repair_retry"] = True' in source
+    assert 'trace["citation_repair_retry_succeeded"] = True' in source
+    assert "remove rather than given a guessed citation" in source
+
+
+def test_multipart_answers_preserve_specific_goal_evidence():
+    source = Path("src/ike/workflows/qa_graph.py").read_text()
+    assert "most explicit evidence available for that goal" in source
+    assert "broader but less informative summary" in source
+    assert "named component, qualifier, unit, frequency, threshold, or condition" in source
+
+
+def test_citation_repair_has_rare_strong_fail_safe_after_fast_retries():
+    source = Path("src/ike/workflows/qa_graph.py").read_text()
+    marker = "citation_repair_strong_fallback"
+    assert marker in source
+    assert "citation_repair_strong_fallback_succeeded" in source
+    fallback_start = source.index(marker)
+    assert "strong=True" in source[fallback_start:fallback_start + 5000]
+    assert "Every factual paragraph or table row must carry at least one valid [E#] citation." in source
 
 
 def test_governing_reference_cannot_short_circuit_global_retrieval():

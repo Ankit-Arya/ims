@@ -1204,9 +1204,18 @@ class RetrievalEngine:
                 candidate.goal_rerank_scores.update(anchor.goal_rerank_scores)
                 candidate.rerank_score = max(0.0, anchor.rerank_score - 0.005)
                 local.append(candidate)
-            # Preserve logical order, but keep the expansion bounded.
+            # Keep the nearest context when the logical section is wider than the
+            # per-anchor budget.  At equal distance prefer the forward chunk: policy
+            # prose and tables commonly continue after the matched heading/first row,
+            # while backward context is still retained when it is strictly nearer.
             if len(local) > per_anchor:
-                local = sorted(local, key=lambda c: abs(c.ordinal - anchor.ordinal))[:per_anchor]
+                local = sorted(
+                    local,
+                    key=lambda c: (
+                        abs(c.ordinal - anchor.ordinal),
+                        0 if c.ordinal >= anchor.ordinal else 1,
+                    ),
+                )[:per_anchor]
                 local.sort(key=lambda c: c.ordinal)
             for candidate in local:
                 if candidate.chunk_id in seen or candidate.chunk_id == anchor.chunk_id:
@@ -1214,6 +1223,136 @@ class RetrievalEngine:
                 expanded.append(candidate)
                 seen.add(candidate.chunk_id)
         return expanded
+
+    def expand_partial_goal_context(
+        self,
+        anchors: list[Candidate],
+        user: User,
+        document_ids: list[UUID] | None,
+    ) -> list[Candidate]:
+        """Expand audited partial evidence within its governing logical section.
+
+        Recovery queries are still useful for missing evidence.  For a partial goal,
+        however, the semantic audit has already identified a relevant anchor.  Long
+        policies frequently split a single entitlement/rate table across adjacent
+        chunks or pages, so bounded section expansion is a higher-signal recovery
+        strategy than repeating another corpus-wide search.
+        """
+        expanded = self._section_expansion(anchors, user, document_ids)
+        for candidate in expanded:
+            candidate.sources.add("partial_goal_section_recovery")
+        return expanded
+
+    def recover_corpus_section_context(
+        self,
+        discovery: dict | None,
+        user: User,
+        document_ids: list[UUID] | None,
+        *,
+        goal_ids: set[str] | None = None,
+    ) -> list[Candidate]:
+        """Admit a bounded structural sample from top corpus-intelligence sections.
+
+        This recovery lane is intentionally independent of the failed chunk-level query.
+        Corpus nodes were already ranked during the first pass, so sampling their boundary
+        chunks adds no embedding/LLM call. First/last chunks preserve both section framing
+        and trailing tables/rules that commonly hold the requested value.
+        """
+        if (
+            not self.settings.adaptive_corpus_section_recovery_enabled
+            or not isinstance(discovery, dict)
+        ):
+            return []
+        hits = discovery.get("hits") or []
+        if not isinstance(hits, list):
+            return []
+
+        allowed = set(document_ids or [])
+        specs: list[tuple[UUID, str, int, int | None, int | None]] = []
+        seen_specs: set[tuple[UUID, str, int | None, int | None]] = set()
+        max_sections = max(1, self.settings.adaptive_corpus_section_recovery_max_sections)
+        for raw in hits:
+            if not isinstance(raw, dict) or raw.get("node_type") != "section":
+                continue
+            try:
+                document_id = UUID(str(raw.get("document_id")))
+            except (TypeError, ValueError):
+                continue
+            if allowed and document_id not in allowed:
+                continue
+            path = [str(item).strip() for item in (raw.get("section_path") or []) if str(item).strip()]
+            if not path:
+                continue
+            # Corpus nodes intentionally normalize breadcrumb punctuation. Match the local
+            # heading plus the node's page range rather than requiring the full Docling
+            # ancestor array to be byte-identical (e.g. "C" vs "-C", optional colons).
+            leaf = path[-1]
+            page_from = raw.get("page_from") if isinstance(raw.get("page_from"), int) else None
+            page_to = raw.get("page_to") if isinstance(raw.get("page_to"), int) else page_from
+            key = (document_id, leaf, page_from, page_to)
+            if key in seen_specs:
+                continue
+            seen_specs.add(key)
+            specs.append((document_id, leaf, len(specs), page_from, page_to))
+            if len(specs) >= max_sections:
+                break
+        if not specs:
+            return []
+
+        predicates = [
+            (Chunk.document_id == document_id) & Chunk.section_path.any(leaf)
+            for document_id, leaf, _rank, _page_from, _page_to in specs
+        ]
+        stmt = (
+            select(Chunk, Document)
+            .join(Document, Document.id == Chunk.document_id)
+            .where(*self._base_filters(user, document_ids), or_(*predicates))
+            .order_by(Chunk.document_id, Chunk.ordinal)
+        )
+        grouped: dict[tuple[UUID, str], list[Candidate]] = defaultdict(list)
+        for chunk, document in self.db.execute(stmt).all():
+            candidate = self._candidate(chunk, document)
+            local_leaf = candidate.section_path[-1] if candidate.section_path else ""
+            grouped[(candidate.document_id, local_leaf)].append(candidate)
+
+        per_section = max(1, self.settings.adaptive_corpus_section_recovery_chunks_per_section)
+        recovered: list[Candidate] = []
+        for document_id, leaf, rank, page_from, page_to in specs:
+            local = grouped.get((document_id, leaf), [])
+            if page_from is not None:
+                upper = page_to if page_to is not None else page_from
+                local = [
+                    candidate
+                    for candidate in local
+                    if candidate.page_from is not None
+                    and page_from <= candidate.page_from <= upper
+                ]
+            if not local:
+                continue
+            if len(local) <= per_section:
+                chosen = local
+            elif per_section == 1:
+                chosen = [local[0]]
+            else:
+                # Boundary sampling is robust for long policy sections: the heading/rule
+                # usually starts at the first chunk while ceilings/tables often finish later.
+                chosen = [local[0], local[-1]]
+                if per_section > 2:
+                    interior = local[1:-1]
+                    step = max(1, len(interior) // (per_section - 1))
+                    chosen = [local[0], *interior[::step][: per_section - 2], local[-1]]
+            score = max(0.05, 0.30 - (rank * 0.02))
+            for candidate in chosen:
+                candidate.sources.add("corpus_section_recovery")
+                for goal_id in goal_ids or set():
+                    candidate.sources.add(f"goal:{goal_id}")
+                    candidate.sources.add(f"goal:{goal_id}:section")
+                candidate.evidence_lane = "corpus_section"
+                candidate.rerank_score = max(candidate.rerank_score, score)
+                candidate.final_retrieval_score = max(candidate.final_retrieval_score, score)
+                candidate.rank_method = "corpus_section_recovery"
+                recovered.append(candidate)
+        return recovered
 
     def _limits(self, profile: str, lookup_term: str | None) -> dict[str, int]:
         if profile == "priority_probe":
@@ -1781,16 +1920,20 @@ class RetrievalEngine:
                         )
 
             if goal_expansions and not include_base_query:
+                # Recovery is a strategy change, not a weighted blend with the failed
+                # first-pass formulations. The caller has already provided either safe
+                # semantic rewrites or deterministic fail-open probes for every unresolved
+                # goal, so re-adding goal_specs here can make the same bad match dominate.
                 add_goal_repair_queries()
-
-            for spec in goal_specs:
-                add_raw_query(
-                    spec["text"],
-                    goal_ids_for_query=list(spec.get("goal_ids") or []),
-                    goal_kinds_for_query=list(spec.get("goal_kinds") or []),
-                    weight=float(spec.get("weight") or 1.0),
-                    origin="evidence_goal",
-                )
+            else:
+                for spec in goal_specs:
+                    add_raw_query(
+                        spec["text"],
+                        goal_ids_for_query=list(spec.get("goal_ids") or []),
+                        goal_kinds_for_query=list(spec.get("goal_kinds") or []),
+                        weight=float(spec.get("weight") or 1.0),
+                        origin="evidence_goal",
+                    )
 
             if goal_expansions and include_base_query:
                 add_goal_repair_queries()

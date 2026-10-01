@@ -95,9 +95,9 @@ class Settings(BaseSettings):
     # Answer usefulness policy. Research always plans structure; Direct stays one-call but
     # may include closely related evidence when it materially helps the user understand/use
     # the answer. This is generalized and never hard-codes topics or documents.
-    helpful_context_mode: Literal["off", "relevant", "rich"] = "rich"
-    helpful_context_max_sections: int = 6
-    direct_max_output_tokens: int = 3200
+    helpful_context_mode: Literal["off", "relevant", "rich"] = "relevant"
+    helpful_context_max_sections: int = 3
+    direct_max_output_tokens: int = 1800
 
     # 0.6.0 operational retrieval. The generic overview lane is searched for every query;
     # its evidence is only shown when relevant. MRGR is the current configured overview book.
@@ -155,6 +155,25 @@ class Settings(BaseSettings):
     # Retrieval-quality gating runs before answer generation and can issue a materially
     # different search-only repair probe when a priority source is incomplete.
     retrieval_quality_gate_enabled: bool = True
+    # When a first-pass answer is incomplete, allow one bounded LLM query-repair call
+    # grounded in corpus headings/section vocabulary before the single recovery search.
+    # Successful queries never pay this latency cost.
+    adaptive_semantic_recovery_enabled: bool = True
+    # Recovery also admits a small first/last-chunk sample from the top semantic corpus
+    # sections. This gives a failed query an independent path out of a wrong-scope chunk
+    # without adding another embedding/LLM call or domain-specific phrase rules.
+    adaptive_corpus_section_recovery_enabled: bool = True
+    adaptive_corpus_section_recovery_max_sections: int = 8
+    adaptive_corpus_section_recovery_chunks_per_section: int = 2
+    # Enumeration/overview failures often live in many sibling sections of one large
+    # handbook. Re-run corpus-section discovery on at most a couple of recovery probes;
+    # these are navigation hints only and never become answer evidence by themselves.
+    adaptive_enumeration_section_rediscovery_enabled: bool = True
+    adaptive_enumeration_section_rediscovery_max_queries: int = 2
+    # Auto mode may broaden retrieval to Research without paying the strong-model latency.
+    # Explicit Research still uses the strong model; this switch is an escape hatch for
+    # environments that prefer maximum synthesis quality over interactive response time.
+    auto_research_strong_answer_enabled: bool = False
     retrieval_repair_max_output_tokens: int = 1200
 
     # 0.9.0 industrial retrieval fabric.  A secondary hierarchical index is built from

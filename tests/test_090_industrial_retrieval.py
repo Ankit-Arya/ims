@@ -64,6 +64,26 @@ def test_enumeration_routes_to_research():
     assert effort.level == "research"
 
 
+def test_single_bounded_all_requested_entities_goal_is_focused_not_full_research():
+    question = "Rate according to designation"
+    query_plan = build_query_plan(question)
+    plan = EvidencePlan(
+        original=question,
+        strategy="single",
+        goals=[
+            EvidenceGoal(
+                id="g1",
+                kind="attribute",
+                question="Establish the rate according to designation.",
+                coverage_contract="all_requested_entities",
+                required=True,
+            )
+        ],
+    )
+    assert query_plan.coverage_sensitive is False
+    assert classify_retrieval_effort(question, query_plan, plan).level == "focused"
+
+
 def test_monotonic_merge_protects_prior_supported_evidence():
     primary = [_evidence(i) for i in range(1, 6)]
     recovered = [_evidence(i + 10) for i in range(1, 6)]

@@ -104,7 +104,7 @@ def test_okf_topic_terms_capture_structure_and_table_labels():
     assert {"travelling", "allowance", "compensation", "stay", "hotel", "entitlement", "designation", "reimbursement"} <= terms
 
 
-def test_generation_uses_raw_prose_and_marks_ancestor_navigation():
+def test_generation_uses_raw_prose_and_hides_stale_ancestor_for_named_section():
     candidate = Candidate(
         chunk_id=uuid4(),
         document_id=uuid4(),
@@ -124,9 +124,25 @@ def test_generation_uses_raw_prose_and_marks_ancestor_navigation():
     block = Evidence("E1", candidate).prompt_block()
 
     assert "Local section: LOCAL RULE" in block
-    assert "Ancestor navigation only (not proof of applicability): PART A / STALE PARENT" in block
+    assert "STALE PARENT" not in block
+    assert "PART A" not in block
     assert "Content:\nActual governing sentence." in block
-    assert "Content:\nPART A" not in block
+
+
+def test_generation_keeps_only_immediate_parent_for_generic_local_heading():
+    candidate = Candidate(
+        chunk_id=uuid4(), document_id=uuid4(), ordinal=2,
+        page_from=11, page_to=11,
+        section_path=["PART A", "GOVERNING RULE", "NOTE:"],
+        content_kind="text", text="Important continuation.",
+        contextual_text="Important continuation.",
+        document_title="Policy.pdf", filename="Policy.pdf",
+        revision=None, authority=None,
+    )
+    block = Evidence("E2", candidate).prompt_block()
+    assert "Local section: NOTE:" in block
+    assert "Parent navigation hint (not evidence/applicability): GOVERNING RULE" in block
+    assert "PART A" not in block
 
 
 def test_table_context_uses_nearest_headings_not_full_ancestor_chain():
