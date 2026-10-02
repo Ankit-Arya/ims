@@ -1301,7 +1301,11 @@ def build_deterministic_evidence_plan(question: str, query_plan: QueryPlan) -> E
                         entity_terms=[entity],
                         required=True,
                         qualifiers=[facet],
-                        coverage_contract=("primary_definition" if facet == "definition" else "single_fact"),
+                        coverage_contract=(
+                            "primary_definition"
+                            if facet == "definition"
+                            else _default_coverage_contract(_facet_goal_kind(facet))
+                        ),
                     )
                 )
                 goal_id += 1
@@ -1416,7 +1420,11 @@ def build_deterministic_evidence_plan(question: str, query_plan: QueryPlan) -> E
                         entity_terms=[entity],
                         required=True,
                         qualifiers=[facet],
-                        coverage_contract=("primary_definition" if facet == "definition" else "single_fact"),
+                        coverage_contract=(
+                            "primary_definition"
+                            if facet == "definition"
+                            else _default_coverage_contract(_facet_goal_kind(facet))
+                        ),
                     )
                 )
                 goal_id += 1

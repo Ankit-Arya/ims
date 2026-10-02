@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 from pathlib import Path
+from uuid import uuid4
 
 from ike.retrieval.vocabulary import fuzzy_query_tokens
 from ike.retrieval.query_plan import build_query_plan
+from ike.retrieval.types import Candidate, Evidence
 from ike.retrieval.search_plan import (
     content_tokens,
     materially_novel_query,
@@ -23,6 +25,7 @@ from ike.workflows.evidence_planning import (
     should_use_semantic_planner,
 )
 from ike.workflows.query_repair import repair_queries_from_payload, repair_system_prompt
+from ike.workflows.retrieval_controller import balanced_recovery_queries, diagnose_recovery
 
 
 def test_normal_multiword_question_uses_fast_semantic_planning():
@@ -174,6 +177,54 @@ def test_repair_controller_allows_conceptual_search_terms_but_blocks_invented_id
     assert "search-only" in prompt
     assert "potentially incomplete or wrong-scope" in prompt
     assert "scope-neutral" in prompt
+
+
+def test_recovery_controller_detects_mentions_that_cannot_satisfy_an_enumeration():
+    plan = EvidencePlan(
+        original="List the depots",
+        goals=[EvidenceGoal(
+            id="g1", kind="enumeration", question="Identify the requested set/list of depots.",
+            search_queries=["depots"], entity_terms=["depots"], required=True,
+            coverage_contract="enumerate_set",
+        )],
+        strategy="enumeration", requires_decomposition=False,
+    )
+    satisfaction = GoalSatisfaction(
+        complete=False,
+        statuses=[GoalStatus(goal_id="g1", status="partial", evidence_ids=["E1"])],
+        partial_goal_ids=["g1"],
+    )
+    candidate = Candidate(
+        chunk_id=uuid4(), document_id=uuid4(), ordinal=1, page_from=1, page_to=1,
+        section_path=["Operating Notes"], content_kind="text",
+        text="The train returns to the depot after service.",
+        contextual_text="Operating Notes. The train returns to the depot after service.",
+        document_title="Manual.pdf", filename="Manual.pdf", revision=None, authority=None,
+        sources={"goal:g1"},
+    )
+    diagnoses = diagnose_recovery(plan, satisfaction, [Evidence(evidence_id="E1", candidate=candidate)])
+
+    assert len(diagnoses) == 1
+    assert diagnoses[0].failure_reason == "mention_without_set_bearing_evidence"
+    assert "structured_evidence_search" in diagnoses[0].recommended_strategies
+    assert diagnoses[0].semantic_rerank_recommended is True
+
+
+def test_recovery_query_budget_is_round_robin_across_unresolved_goals():
+    selected = balanced_recovery_queries(
+        ["g1", "g2", "g3"],
+        {
+            "g1": ["crew control query 1", "crew control query 2"],
+            "g2": ["depot query 1", "depot query 2"],
+            "g3": ["interchange query 1", "interchange query 2"],
+        },
+        minimum_total_budget=2,
+    )
+    assert selected == [
+        "crew control query 1",
+        "depot query 1",
+        "interchange query 1",
+    ]
 
 
 def test_repair_can_bridge_layman_wording_to_trusted_corpus_terminology():

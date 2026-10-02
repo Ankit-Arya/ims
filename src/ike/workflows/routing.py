@@ -232,12 +232,37 @@ def _shared_suffix_slash_entities(value: str) -> list[str]:
     return [f"{left} {suffix}", f"{right} {suffix}"]
 
 
+def _strip_enumeration_request_wrapper(value: str) -> str:
+    """Remove nested request grammar before list/entity segmentation.
+
+    Queries such as ``provide list of A, B and C`` are common in natural speech. The
+    outer ``provide`` cue is consumed by the main extractor, which previously left
+    ``list of A`` as the first entity. Strip only generic enumeration scaffolding here;
+    the entity nouns themselves remain untouched.
+    """
+
+    cleaned = re.sub(r"\s+", " ", value.strip())
+    previous = None
+    while cleaned and cleaned != previous:
+        previous = cleaned
+        cleaned = re.sub(
+            r"^(?:(?:a|the)\s+)?(?:(?:complete|full)\s+)?(?:list(?:ing)?|set|enumeration)\s+(?:of\s+)?",
+            "",
+            cleaned,
+            flags=re.IGNORECASE,
+        ).strip()
+        cleaned = re.sub(r"^(?:all\s+(?:the\s+)?)", "", cleaned, flags=re.IGNORECASE).strip()
+    return cleaned
+
+
 def _split_coordinated_entities(value: str, *, explicit_enumeration: bool) -> list[str]:
     """Split a bounded list target into independent entity/category phrases when safe."""
 
     if not explicit_enumeration:
         cleaned = _clean_entity_candidate(value)
         return [cleaned] if cleaned else []
+
+    value = _strip_enumeration_request_wrapper(value)
 
     has_punctuation = bool(re.search(r"[,;]", value))
     has_conjunction = bool(re.search(r"\s+(?:and|&)\s+", value, re.IGNORECASE))

@@ -17,6 +17,7 @@ from ike.retrieval.corpus_intelligence import CorpusDiscovery, CorpusIntelligenc
 from ike.retrieval.fusion import reciprocal_rank_fusion
 from ike.retrieval.lookup import definition_score
 from ike.retrieval.evidence_selection import deduplicate_candidates
+from ike.retrieval.evidence_shape import enumeration_shape_score
 from ike.retrieval.hierarchical import same_logical_section
 from ike.retrieval.normalization import lexical_form_variants, technical_identifier_variants
 from ike.retrieval.overview import overview_name_matches
@@ -769,6 +770,13 @@ class RetrievalEngine:
                     if candidate.content_kind == "table" and len(candidate.text or "") <= 1800
                     else 0.0
                 )
+                shape_score = (
+                    enumeration_shape_score(entity, candidate)
+                    if "enumeration" in facets
+                    else 0.0
+                )
+                if shape_score >= 0.35:
+                    candidate.sources.add("evidence_shape:enumeration")
                 # Sibling co-location is deliberately strong for coordinated list queries:
                 # one structured source that contains several requested categories is often
                 # a better list/index than an incidental mention of only one category.
@@ -779,6 +787,7 @@ class RetrievalEngine:
                     + min(8.0, attribute_hits * 2.0)
                     + min(6.0, structural_hits * 1.5)
                     + min(12.0, sibling_hits * 6.0)
+                    + min(10.0, shape_score * 10.0)
                     + (2.0 if title_hit else 0.0)
                 )
                 rank_float = float(rank_value or 0.0)
@@ -1463,6 +1472,12 @@ class RetrievalEngine:
     ) -> tuple[list[Evidence], dict]:
         started = time.perf_counter()
         query_plan = query_plan or build_query_plan(question)
+        recovery_mode = bool(goal_expansions and goal_ids and not include_base_query)
+        enumeration_recovery_goal_ids = {
+            goal.id
+            for goal in (evidence_plan.goals if evidence_plan is not None else [])
+            if goal.kind == "enumeration" and (goal_ids is None or goal.id in goal_ids)
+        }
         lookup_term = query_plan.lookup_term if include_base_query else None
         # A base-query definition lookup must never dominate a decomposed request.
         # Definition evidence for multipart questions is retrieved through the relevant
@@ -1838,6 +1853,26 @@ class RetrievalEngine:
             limits["rerank"] = min(
                 limits["fused"],
                 max(8, self.settings.compositional_rerank_top_k),
+            )
+
+        if recovery_mode and enumeration_recovery_goal_ids:
+            # Complete-set questions are different from scalar lookups: the right answer may
+            # require many rows or several line/document tables. Broaden only the already-
+            # justified recovery pass; the normal first pass remains unchanged.
+            limits["fused"] = max(
+                limits["fused"],
+                min(48, self.settings.enumeration_recovery_rerank_candidates * len(enumeration_recovery_goal_ids)),
+            )
+            limits["rerank"] = max(
+                limits["rerank"],
+                min(
+                    limits["fused"],
+                    self.settings.enumeration_recovery_rerank_top_k * len(enumeration_recovery_goal_ids),
+                ),
+            )
+            limits["evidence"] = max(
+                limits["evidence"],
+                self.settings.enumeration_recovery_evidence_k,
             )
 
         # 0.7.0 builds retrieval formulations around atomic evidence goals first.
@@ -2581,12 +2616,18 @@ class RetrievalEngine:
                     table_query_affinity(question, candidate),
                 )
             applicability = applicability_score(query_plan, candidate) if candidate is not None else 0.0
+            shape_bonus = 0.0
+            if candidate is not None and "enumeration" in set(query_plan.facets or []):
+                shape_score = enumeration_shape_score(question, candidate)
+                shape_bonus = min(0.10, shape_score * 0.10)
+                if shape_score >= 0.35:
+                    candidate.sources.add("evidence_shape:enumeration")
             okf_bonus = 0.0
             if candidate is not None:
                 candidate.applicability_score = applicability
                 if candidate.document_id in priority_document_id_set and "okf_routed" in candidate.sources:
                     okf_bonus = max(0.0, float(self.settings.okf_query_fusion_bonus))
-            adjusted_scores[chunk_id] = score + bonus + applicability + okf_bonus
+            adjusted_scores[chunk_id] = score + bonus + applicability + okf_bonus + shape_bonus
         fused_cap = min(limits["fused"], max(8, self.settings.rerank_prefilter_max_candidates))
         globally_ranked_ids = sorted(
             fused, key=lambda chunk_id: adjusted_scores[chunk_id], reverse=True
@@ -2829,6 +2870,20 @@ class RetrievalEngine:
             per_goal_details: dict[str, dict] = {}
             ranked_candidates_by_goal: dict[str, list[Candidate]] = {}
 
+            def goal_candidate_limit(goal) -> int:
+                if recovery_mode and goal.kind == "enumeration":
+                    return max(
+                        self.settings.goal_local_rerank_candidates,
+                        self.settings.enumeration_recovery_rerank_candidates,
+                    )
+                return self.settings.goal_local_rerank_candidates
+
+            def goal_top_k(goal, candidate_count: int) -> int:
+                configured = self.settings.goal_local_rerank_top_k
+                if recovery_mode and goal.kind == "enumeration":
+                    configured = max(configured, self.settings.enumeration_recovery_rerank_top_k)
+                return min(configured, candidate_count)
+
             for goal in active_goals_for_rerank:
                 ranked_for_goal = sorted(
                     [
@@ -2838,7 +2893,7 @@ class RetrievalEngine:
                     ],
                     key=lambda candidate: (candidate.fused_score, -candidate.ordinal),
                     reverse=True,
-                )[: self.settings.goal_local_rerank_candidates]
+                )[: goal_candidate_limit(goal)]
                 ranked_candidates_by_goal[goal.id] = ranked_for_goal
                 if not ranked_for_goal:
                     per_goal_selected[goal.id] = []
@@ -2862,7 +2917,7 @@ class RetrievalEngine:
                         goal.id,
                         goal.question,
                         [retrieval_text(candidate) for candidate in ranked_candidates_by_goal[goal.id]],
-                        min(self.settings.goal_local_rerank_top_k, len(ranked_candidates_by_goal[goal.id])),
+                        goal_top_k(goal, len(ranked_candidates_by_goal[goal.id])),
                     )
                     for goal in nonempty_goals
                 ]
@@ -2900,7 +2955,7 @@ class RetrievalEngine:
                     results, timing = self.inference.rerank(
                         goal.question,
                         [retrieval_text(candidate) for candidate in ranked_for_goal],
-                        top_k=min(self.settings.goal_local_rerank_top_k, len(ranked_for_goal)),
+                        top_k=goal_top_k(goal, len(ranked_for_goal)),
                         request_id=request_id,
                     )
                     total_queue_wait += timing.queue_wait_ms
@@ -2924,6 +2979,46 @@ class RetrievalEngine:
                         "batch_rerank": False,
                     }
                 rerank_mode = "goal_local"
+
+            if recovery_mode and enumeration_recovery_goal_ids:
+                # Small-to-big recovery: once the cross-encoder finds a genuinely
+                # set-bearing row/chunk, pull bounded continuation chunks from the same
+                # logical section. This is especially important for long tables split by
+                # the chunker, and is generic across any list/directory/inventory question.
+                for goal in nonempty_goals:
+                    if goal.id not in enumeration_recovery_goal_ids:
+                        continue
+                    selected = per_goal_selected.get(goal.id, [])
+                    anchors = [
+                        candidate
+                        for candidate in selected
+                        if enumeration_shape_score(goal.question, candidate) >= 0.35
+                    ][:2]
+                    if not anchors:
+                        continue
+                    context = self._section_expansion(anchors, user, document_ids)
+                    seen_goal = {candidate.chunk_id for candidate in selected}
+                    added = 0
+                    max_goal_items = max(
+                        self.settings.enumeration_recovery_rerank_top_k,
+                        self.settings.enumeration_recovery_rerank_top_k
+                        + self.settings.hierarchical_max_chunks_per_anchor,
+                    )
+                    for candidate in context:
+                        if candidate.chunk_id in seen_goal:
+                            continue
+                        candidate.sources.add("enumeration_section_recovery")
+                        candidate.sources.add(f"goal:{goal.id}")
+                        candidate.sources.add(f"goal:{goal.id}:section")
+                        selected.append(candidate)
+                        seen_goal.add(candidate.chunk_id)
+                        added += 1
+                        if len(selected) >= max_goal_items:
+                            break
+                    per_goal_selected[goal.id] = selected
+                    details = per_goal_details.setdefault(goal.id, {})
+                    details["section_context_added"] = added
+                    details["selected_count_with_context"] = len(selected)
 
             # Fan-in is round-robin so every required goal keeps its best evidence.
             ordered_goals = [goal for goal in active_goals_for_rerank if goal.required] + [

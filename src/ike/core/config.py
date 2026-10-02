@@ -150,6 +150,12 @@ class Settings(BaseSettings):
     interactive_research_cross_encoder_enabled: bool = False
     goal_local_rerank_candidates: int = 10
     goal_local_rerank_top_k: int = 4
+    # Enumeration recovery needs broader evidence than scalar lookups because a complete
+    # set can span multiple rows/chunks/documents. These larger bounds are used only after
+    # the first evidence audit proves a list/set goal is incomplete.
+    enumeration_recovery_rerank_candidates: int = 14
+    enumeration_recovery_rerank_top_k: int = 8
+    enumeration_recovery_evidence_k: int = 24
     compositional_definition_evidence_per_goal: int = 6
 
     # Retrieval-quality gating runs before answer generation and can issue a materially
@@ -159,6 +165,10 @@ class Settings(BaseSettings):
     # grounded in corpus headings/section vocabulary before the single recovery search.
     # Successful queries never pay this latency cost.
     adaptive_semantic_recovery_enabled: bool = True
+    # Successful interactive queries stay on hybrid fusion. Once the evidence auditor has
+    # proven a goal is missing/partial, allow the single bounded recovery pass to use the
+    # cross-encoder so a relevant mention can be distinguished from answer-bearing evidence.
+    adaptive_recovery_cross_encoder_enabled: bool = True
     # Recovery also admits a small first/last-chunk sample from the top semantic corpus
     # sections. This gives a failed query an independent path out of a wrong-scope chunk
     # without adding another embedding/LLM call or domain-specific phrase rules.

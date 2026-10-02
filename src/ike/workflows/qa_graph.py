@@ -47,6 +47,11 @@ from ike.workflows.query_repair import (
     repair_system_prompt,
     repair_user_prompt,
 )
+from ike.workflows.retrieval_controller import (
+    balanced_recovery_queries,
+    diagnose_recovery,
+    diagnoses_prompt_block,
+)
 from ike.workflows.routing import (
     extract_lookup_term,
     is_complex_question,
@@ -1353,6 +1358,17 @@ class QAGraphService:
                 "workflow_timings_ms": self._timing_update(state, "goal_recovery_skipped", started),
             }
 
+        diagnoses = diagnose_recovery(
+            evidence_plan,
+            satisfaction,
+            state.get("evidence", []),
+            quality_issues=quality_issues,
+        )
+        semantic_rerank_recommended = any(
+            item.goal_id in set(unresolved) and item.semantic_rerank_recommended
+            for item in diagnoses
+        )
+
         self._emit(
             "recover",
             "Recovering missing evidence",
@@ -1389,7 +1405,9 @@ class QAGraphService:
         )
         corpus_hint_text = self._corpus_repair_hints(state.get("corpus_discovery"))
         repair_context = (
-            "CORPUS-INDEX SEARCH HINTS (not answer evidence):\n"
+            "RECOVERY DIAGNOSIS (search-control hints, not answer evidence):\n"
+            + diagnoses_prompt_block(diagnoses)
+            + "\n\nCORPUS-INDEX SEARCH HINTS (not answer evidence):\n"
             + corpus_hint_text
             + "\n\nPREVIOUS RETRIEVAL EVIDENCE (may be partial or wrong-scope):\n"
             + compact
@@ -1482,21 +1500,12 @@ class QAGraphService:
                 for goal in evidence_plan.goals
                 if goal.id in set(unresolved) and goal.kind in {"enumeration", "overview"}
             }
-            seen_rediscovery: set[str] = set()
-            for goal_id in unresolved:
-                if goal_id not in enum_goal_ids:
-                    continue
-                for query in expansions.get(goal_id, []):
-                    cleaned = re.sub(r"\s+", " ", str(query or "").strip())
-                    key = cleaned.casefold()
-                    if not cleaned or key in seen_rediscovery:
-                        continue
-                    seen_rediscovery.add(key)
-                    enumeration_rediscovery_queries.append(cleaned)
-                    if len(enumeration_rediscovery_queries) >= self.settings.adaptive_enumeration_section_rediscovery_max_queries:
-                        break
-                if len(enumeration_rediscovery_queries) >= self.settings.adaptive_enumeration_section_rediscovery_max_queries:
-                    break
+            enum_goal_order = [goal_id for goal_id in unresolved if goal_id in enum_goal_ids]
+            enumeration_rediscovery_queries = balanced_recovery_queries(
+                enum_goal_order,
+                expansions,
+                minimum_total_budget=self.settings.adaptive_enumeration_section_rediscovery_max_queries,
+            )
 
             if enumeration_rediscovery_queries:
                 hint_scope_ids = state.get("document_ids") or state.get("okf_document_ids") or None
@@ -1587,20 +1596,29 @@ class QAGraphService:
             for i, candidate in enumerate(corpus_section_candidates, 1)
         ]
 
-        recovered, recovery_trace = self.retrieval.retrieve(
-            state["question"],
-            self.user,
-            recovery_scope_ids,
-            profile=(
-                "realtime"
-                if realtime_recovery
+        recovery_profile = (
+            "realtime"
+            if realtime_recovery
+            else (
+                "research"
+                if (
+                    self.settings.adaptive_recovery_cross_encoder_enabled
+                    and semantic_rerank_recommended
+                )
                 else (
                     "research"
                     if state.get("requested_mode") == "research"
                     and self.settings.interactive_research_cross_encoder_enabled
                     else ("qa_research" if state.get("retrieval_effort") == "research" else "qa_focused")
                 )
-            ),
+            )
+        )
+
+        recovered, recovery_trace = self.retrieval.retrieve(
+            state["question"],
+            self.user,
+            recovery_scope_ids,
+            profile=recovery_profile,
             query_plan=state.get("query_plan"),
             evidence_plan=evidence_plan,
             goal_ids=set(unresolved),
@@ -1655,9 +1673,13 @@ class QAGraphService:
             "source_counts": recovery_trace.get("source_counts", {}),
             "fused_candidates": recovery_trace.get("fused_candidates", 0),
             "reranked_candidates": recovery_trace.get("reranked_candidates", 0),
+            "rerank_details": recovery_trace.get("rerank_details", {}),
             "goal_stats": recovery_trace.get("goal_stats", {}),
             "semantic_recovery_attempted": semantic_recovery_attempted,
             "semantic_recovery_query_count": sum(len(items) for items in expansions.values()),
+            "recovery_profile": recovery_profile,
+            "adaptive_cross_encoder_used": recovery_profile == "research",
+            "diagnoses": [item.as_dict() for item in diagnoses],
             "enumeration_section_rediscovery_queries": enumeration_rediscovery_queries,
             "enumeration_section_rediscovery_hit_count": enumeration_rediscovery_hit_count,
             "partial_section_anchor_evidence_ids": partial_anchor_ids,
