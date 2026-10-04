@@ -28,6 +28,14 @@ from ike.workflows.query_repair import repair_queries_from_payload, repair_syste
 from ike.workflows.retrieval_controller import balanced_recovery_queries, diagnose_recovery
 
 
+def test_production_query_control_does_not_hardcode_named_rulebook():
+    production = "\n".join(
+        path.read_text(encoding="utf-8", errors="ignore")
+        for path in Path("src/ike").rglob("*.py")
+    ).casefold()
+    assert "mrgr" not in production
+
+
 def test_normal_multiword_question_uses_fast_semantic_planning():
     question = "Who activates the cooling plant and when?"
     query_plan = build_query_plan(question)
@@ -45,9 +53,13 @@ def test_bare_multi_identifier_lookup_keeps_deterministic_fast_path():
 
 def test_semantic_planner_treats_generated_terms_as_search_only_hypotheses():
     prompt = semantic_planner_system_prompt(10, 4).casefold()
+    assert "primary semantic interpreter" in prompt
     assert "search-only hypotheses" in prompt
     assert "section-heading vocabulary" in prompt
     assert "must never be treated as facts" in prompt
+    assert "document_structure" in prompt
+    assert "section_navigation" in prompt
+    assert "do not mechanically map" in prompt
 
 
 def test_relaxed_lexical_representation_removes_request_scaffolding_without_adding_terms():

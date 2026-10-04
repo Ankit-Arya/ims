@@ -4,10 +4,10 @@ import re
 
 
 def overview_name_matches(title: str | None, filename: str | None, pattern: str) -> bool:
-    """Configurable overview-document identity; default pattern is MRGR.
+    """Configurable optional overview-document identity.
 
-    The special role is not hard-coded to a database UUID or filename. Administrators can
-    change OVERVIEW_DOCUMENT_PATTERN without code changes.
+    No source is privileged by default. Administrators can opt into a pattern without
+    changing application code.
     """
     needle = re.sub(r"\s+", "", pattern or "").casefold()
     if not needle:

@@ -276,6 +276,8 @@ body[data-theme="dark"] .primary { color:#08111f; }
 .picker-empty { grid-column:1/-1;padding:22px;text-align:center;color:var(--muted);font-size:11px; }
 
 .answer-toolbar { display:flex;justify-content:space-between;gap:10px;align-items:center;margin-bottom:12px;flex-wrap:wrap; }
+.answer-actions { display:flex;align-items:center;gap:7px;flex-wrap:wrap; }
+.debug-download { display:inline-flex;align-items:center;text-decoration:none;font-size:11px; }
 .badges { display:flex;gap:6px;flex-wrap:wrap; }
 .badge { font-size:10px;font-weight:850;border-radius:999px;background:var(--surface-3);padding:5px 8px;color:var(--muted); }
 .badge.primary-badge { background:var(--primary-soft);color:var(--primary); }

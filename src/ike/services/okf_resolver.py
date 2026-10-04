@@ -109,16 +109,24 @@ def _constraint_topic_anchor(question: str, plan: QueryPlan, evidence_plan: Evid
 
 
 def _trusted_plan_terms(evidence_plan: EvidencePlan | None) -> set[str]:
-    """Return bounded routing hints from deterministic plans we construct ourselves.
+    """Return bounded, non-factual routing hints from the active evidence plan.
 
-    Free-form semantic planner prose is deliberately excluded from OKF routing.  The
-    policy/entitlement planner, however, emits a small fixed vocabulary bridge such as
-    "official tour ... daily allowance ... local conveyance".  Those probes are safer
-    and more discriminative than literal layman wording such as "what all can I claim".
+    Semantic plans may influence OKF routing only through user-grounded source/entity terms.
+    Free-form generated factual prose is still excluded. OKF remains a soft prior and never
+    makes these hints answer evidence.
     """
-    if evidence_plan is None or "policy_entitlement_plan" not in evidence_plan.warnings:
+    if evidence_plan is None:
         return set()
     terms: set[str] = set()
+    if evidence_plan.planner_source == "semantic":
+        for value in [*evidence_plan.source_hints, *evidence_plan.entities]:
+            terms.update(_tokens(value))
+        for goal in evidence_plan.goals[:8]:
+            for value in goal.entity_terms:
+                terms.update(_tokens(value))
+        return terms
+    if "policy_entitlement_plan" not in evidence_plan.warnings:
+        return set()
     for goal in evidence_plan.goals[:6]:
         if goal.search_queries:
             terms.update(_tokens(goal.search_queries[0]))

@@ -99,11 +99,9 @@ class Settings(BaseSettings):
     helpful_context_max_sections: int = 3
     direct_max_output_tokens: int = 1800
 
-    # 0.6.0 operational retrieval. The generic overview lane is searched for every query;
-    # its evidence is only shown when relevant. MRGR is the current configured overview book.
-    # Governing references are always-considered evidence lanes (for example MRGR),
-    # not priority gates.  The legacy OVERVIEW_* settings remain as compatibility
-    # fallbacks during rollout.
+    # Generic optional governing/overview lanes. No organisation document is privileged
+    # by application code; administrators may configure patterns explicitly when desired.
+    # The legacy OVERVIEW_* settings remain as compatibility fallbacks during rollout.
     governing_reference_enabled: bool = True
     governing_reference_patterns: str = ""
     governing_reference_dense_top_k: int = 6
@@ -111,7 +109,7 @@ class Settings(BaseSettings):
     governing_reference_evidence_k: int = 2
 
     overview_retrieval_enabled: bool = True
-    overview_document_pattern: str = "MRGR"
+    overview_document_pattern: str = ""
     overview_dense_top_k: int = 12
     overview_lexical_top_k: int = 12
     overview_evidence_k: int = 4
@@ -165,6 +163,9 @@ class Settings(BaseSettings):
     # grounded in corpus headings/section vocabulary before the single recovery search.
     # Successful queries never pay this latency cost.
     adaptive_semantic_recovery_enabled: bool = True
+    # If the evidence audit proves the active semantic contract itself may be wrong, allow
+    # one bounded full semantic replan before the single recovery retrieval pass.
+    adaptive_semantic_replanning_enabled: bool = True
     # Successful interactive queries stay on hybrid fusion. Once the evidence auditor has
     # proven a goal is missing/partial, allow the single bounded recovery pass to use the
     # cross-encoder so a relevant mention can be distinguished from answer-bearing evidence.
@@ -185,6 +186,24 @@ class Settings(BaseSettings):
     # environments that prefer maximum synthesis quality over interactive response time.
     auto_research_strong_answer_enabled: bool = False
     retrieval_repair_max_output_tokens: int = 1200
+    # Testing/acceptance aid: expose a per-query downloadable forensic report to the
+    # user who asked the question (and admins). Disable after acceptance if desired.
+    query_debug_download_enabled: bool = True
+
+    # Agentic QA rollout. The research agent owns semantic interpretation and chooses
+    # read-only corpus tools dynamically; the legacy graph remains available as fallback.
+    agentic_qa_enabled: bool = True
+    agentic_qa_fallback_enabled: bool = True
+    agent_max_tool_calls: int = 4
+    agent_search_top_k: int = 8
+    agent_search_prefilter_k: int = 16
+    agent_rerank_text_chars: int = 2800
+    agent_rerank_enabled: bool = False
+    agent_max_evidence: int = 18
+    agent_max_documents: int = 8
+    agent_max_section_chunks: int = 32
+    agent_controller_max_output_tokens: int = 900
+    agent_answer_max_output_tokens: int = 2600
 
     # 0.9.0 industrial retrieval fabric.  A secondary hierarchical index is built from
     # existing chunks so query-time planning can use the organisation's own vocabulary
@@ -283,6 +302,9 @@ class Settings(BaseSettings):
     # into bounded evidence goals before retrieval. These limits are deliberately small
     # so arbitrary user wording cannot create unbounded fan-out or CPU reranking work.
     compositional_planning_enabled: bool = True
+    # Primary query understanding is LLM-driven. Deterministic routing remains
+    # a fail-open fallback and supplies safety metadata only; it must not decide user intent.
+    semantic_primary_planning_enabled: bool = True
     compositional_semantic_planning_enabled: bool = True
     # Even when full semantic planning is disabled, structurally lossy deterministic plans
     # may receive one bounded semantic repair pass. Troubleshooting/definition paths remain deterministic.
@@ -407,8 +429,8 @@ class Settings(BaseSettings):
         configured = split_patterns(self.governing_reference_patterns)
         if configured:
             return configured
-        # Upgrade compatibility: existing deployments already identify MRGR (or another
-        # general rulebook) through OVERVIEW_DOCUMENT_PATTERN.
+        # Upgrade compatibility: deployments may identify a general governing reference
+        # through OVERVIEW_DOCUMENT_PATTERN without application-code special cases.
         return split_patterns(self.overview_document_pattern)
 
     @property

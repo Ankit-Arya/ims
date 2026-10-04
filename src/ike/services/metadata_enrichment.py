@@ -29,7 +29,7 @@ def infer_operational_profile(title: str, filename: str, samples: list[str]) -> 
         ("troubleshooting", ("troubleshooting", "fault finding", "fault isolation")),
         ("emergency", ("emergency procedure", "emergency response")),
         ("operating_manual", ("operating manual", "operation manual", "train operator")),
-        ("rules", ("general rules", "metro railway general rules", "mrgr")),
+        ("rules", ("general rules", "metro railway general rules", "rule book", "rulebook")),
         ("maintenance", ("maintenance manual", "maintenance instruction")),
         ("training_reference", ("training manual", "handbook")),
     ):
@@ -39,7 +39,7 @@ def infer_operational_profile(title: str, filename: str, samples: list[str]) -> 
     confidence = 0.35
     if lines or stocks:
         confidence = 0.75
-    if (title and title.casefold() in lowered) or "mrgr" in lowered:
+    if title and title.casefold() in lowered:
         confidence = max(confidence, 0.8)
     return {
         "primary_line_codes": _top(primary_lines),

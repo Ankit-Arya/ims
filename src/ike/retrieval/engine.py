@@ -8,7 +8,7 @@ from sqlalchemy import desc, func, or_, select, text
 from sqlalchemy.orm import Session
 
 from ike.core.config import get_settings
-from ike.db.models import Chunk, Document, User
+from ike.db.models import Chunk, Document, RetrievalNode, User
 from ike.retrieval.access import document_access_clause
 from ike.retrieval.applicability import applicability_score
 from ike.retrieval.query_plan import QueryPlan, build_query_plan
@@ -102,8 +102,8 @@ class RetrievalEngine:
     ) -> list[UUID]:
         """Resolve an explicit documentary source phrase to accessible ready documents.
 
-        This is intentionally title/filename based. A strong user phrase such as MRGR, ADM,
-        HR Compendium or train operation handbook is a document selector, not answer text.
+        This is intentionally title/filename based. A strong user phrase that names an
+        uploaded rulebook, manual, compendium or handbook is a document selector, not answer text.
         Weak/non-document qualifiers should already have been rejected by routing.
         """
         cleaned = re.sub(r"\s+", " ", str(source_scope or "").strip())
@@ -128,16 +128,50 @@ class RetrievalEngine:
             ).where(document_access_clause(user), Document.ingestion_status == "ready")
         ).all()
         ranked: list[tuple[int, UUID]] = []
+        generic_name_words = {
+            "pdf", "document", "file", "manual", "handbook", "rulebook", "rules",
+            "book", "version", "ver", "revision", "rev",
+        }
+
+        def source_name_score(raw_name: str) -> int:
+            # Prefer the document whose own title most closely *is* the named source,
+            # rather than a derivative circular/instruction that merely mentions it.
+            # This is generic filename/title canonicality, not organisation vocabulary.
+            value = re.sub(r"\.(?:pdf|docx?)\s*$", "", str(raw_name or ""), flags=re.IGNORECASE)
+            value = re.sub(r"^\s*\d+\s*[._)\-]+\s*", "", value)
+            value_compact = re.sub(r"[^a-z0-9]", "", value.casefold())
+            if not value_compact or compact not in value_compact:
+                return 0
+
+            words = [
+                token.casefold()
+                for token in re.findall(r"[A-Za-z0-9]+", value)
+                if len(token) >= 2
+            ]
+            score = 20
+            if value_compact == compact:
+                score += 80
+            elif value_compact.startswith(compact):
+                # A title such as "<source> 2020" is usually the source itself; a title
+                # such as "Issuance of <source>" is usually derivative material.
+                score += 44
+            token_hits = sum(1 for token in tokens if token in words or token in value.casefold())
+            score += token_hits * 5
+
+            query_words = set(tokens)
+            extra_alpha = [
+                word for word in words
+                if not word.isdigit()
+                and word not in query_words
+                and word not in generic_name_words
+            ]
+            score -= min(32, len(extra_alpha) * 4)
+            return max(0, score)
+
         for document_id, title, filename, _status, lifecycle_status in rows:
             if lifecycle_status not in {None, "active"}:
                 continue
-            name = f"{title or ''} {filename or ''}"
-            name_compact = re.sub(r"[^a-z0-9]", "", name.casefold())
-            score = 0
-            if compact in name_compact:
-                score += 20
-            token_hits = sum(1 for token in tokens if token in name.casefold())
-            score += token_hits * 4
+            score = max(source_name_score(title or ""), source_name_score(filename or ""))
             if score:
                 ranked.append((score, document_id))
         ranked.sort(key=lambda item: item[0], reverse=True)
@@ -1252,6 +1286,317 @@ class RetrievalEngine:
             candidate.sources.add("partial_goal_section_recovery")
         return expanded
 
+    def retrieve_planned_structural_context(
+        self,
+        plan: EvidencePlan | None,
+        user: User,
+        document_ids: list[UUID] | None,
+        *,
+        max_candidates: int = 24,
+    ) -> list[Candidate]:
+        """Execute LLM-selected structural retrieval tools against trusted corpus indexes.
+
+        The semantic planner chooses the retrieval primitive; this method contains no
+        organisation- or query-specific vocabulary. RetrievalNode rows are navigation
+        metadata only. Returned evidence always comes from original Chunk rows.
+        """
+
+        if plan is None:
+            return []
+        structural_goals = [
+            goal
+            for goal in plan.goals
+            if any(tool in {"document_structure", "section_navigation"} for tool in goal.retrieval_tools)
+        ]
+        if not structural_goals:
+            return []
+
+        result: list[Candidate] = []
+        seen_chunks: set[UUID] = set()
+
+        # Source hints can resolve aliases plus derivative documents. Rank the accessible
+        # candidates by how directly their title/filename represents the hinted source.
+        # This is generic source identity resolution: no organisation document names or
+        # derivative-document keywords are encoded here.
+        structural_document_ids = list(document_ids or [])
+        source_affinity: dict[UUID, float] = {}
+        if structural_document_ids and plan.source_hints:
+            documents_for_scope = list(
+                self.db.scalars(
+                    select(Document).where(
+                        document_access_clause(user),
+                        Document.ingestion_status == "ready",
+                        Document.id.in_(structural_document_ids),
+                    )
+                ).all()
+            )
+            for document in documents_for_scope:
+                name = f"{document.title or ''} {document.original_filename or ''}".casefold()
+                title_value = (document.title or document.original_filename or "").casefold()
+                name_tokens = set(re.findall(r"[a-z0-9]+", title_value))
+                name_compact = re.sub(r"[^a-z0-9]", "", title_value)
+                score = 0.0
+                for raw_hint in plan.source_hints:
+                    hint = str(raw_hint or "").strip().casefold()
+                    hint_tokens = set(re.findall(r"[a-z0-9]+", hint))
+                    if not hint_tokens:
+                        continue
+                    hits = len(hint_tokens & name_tokens)
+                    recall = hits / len(hint_tokens)
+                    precision = hits / max(1, len(name_tokens))
+                    hint_compact = re.sub(r"[^a-z0-9]", "", hint)
+                    hint_score = recall * 8.0 + precision * 6.0
+                    if hint_compact and hint_compact in name_compact:
+                        hint_score += 4.0
+                    if hint_compact and hint_compact == name_compact:
+                        hint_score += 8.0
+                    # A hint may be an acronym while the filename contains punctuation or
+                    # revision text. Token scoring above still works without special cases.
+                    if hint in name:
+                        hint_score += 1.0
+                    score += hint_score
+                source_affinity[document.id] = score
+
+            ranked_scope = sorted(
+                structural_document_ids,
+                key=lambda doc_id: source_affinity.get(doc_id, 0.0),
+                reverse=True,
+            )
+            if ranked_scope and source_affinity.get(ranked_scope[0], 0.0) > 0.0:
+                best = source_affinity[ranked_scope[0]]
+                # Keep close aliases/copies, but discard weak incidental source-name matches.
+                # A later semantic replan can change source_hints if this identity was wrong.
+                floor = max(0.0, best * 0.72)
+                structural_document_ids = [
+                    doc_id for doc_id in ranked_scope
+                    if source_affinity.get(doc_id, 0.0) >= floor
+                ][:3]
+
+        # document_structure: expose one original chunk per distinct top-level section.
+        structure_goals = [
+            goal for goal in structural_goals if "document_structure" in goal.retrieval_tools
+        ]
+        if structure_goals and structural_document_ids:
+            node_stmt = (
+                select(RetrievalNode, Document)
+                .join(Document, Document.id == RetrievalNode.document_id)
+                .where(
+                    document_access_clause(user),
+                    Document.ingestion_status == "ready",
+                    or_(Document.lifecycle_status.is_(None), Document.lifecycle_status == "active"),
+                    RetrievalNode.node_type == "section",
+                    RetrievalNode.document_id.in_(structural_document_ids),
+                )
+                .order_by(RetrievalNode.document_id, RetrievalNode.page_from, RetrievalNode.ordinal_from)
+                .limit(3000)
+            )
+            top_nodes: dict[UUID, dict[str, RetrievalNode]] = defaultdict(dict)
+            documents: dict[UUID, Document] = {}
+            for node, document in self.db.execute(node_stmt).all():
+                path = [str(value).strip() for value in (node.section_path or []) if str(value).strip()]
+                if not path:
+                    continue
+                documents[document.id] = document
+                top = path[0]
+                current = top_nodes[document.id].get(top)
+                current_order = (
+                    current.ordinal_from if current is not None and current.ordinal_from is not None else 10**9
+                )
+                node_order = node.ordinal_from if node.ordinal_from is not None else 10**9
+                if current is None or node_order < current_order:
+                    top_nodes[document.id][top] = node
+
+            selected_documents = [doc_id for doc_id, values in top_nodes.items() if values]
+            selected_documents = sorted(
+                selected_documents,
+                key=lambda doc_id: (
+                    source_affinity.get(doc_id, 0.0),
+                    len(top_nodes.get(doc_id, {})),
+                ),
+                reverse=True,
+            )
+            if selected_documents:
+                best_affinity = source_affinity.get(selected_documents[0], 0.0)
+                best_structure = len(top_nodes.get(selected_documents[0], {}))
+                # Prefer a source that is both directly named and structurally rich. Keep a
+                # second near-tie for genuine multi-volume/copy cases, but do not let a weak
+                # derivative consume the hierarchy evidence budget before the main source.
+                selected_documents = [
+                    doc_id for doc_id in selected_documents
+                    if (
+                        source_affinity.get(doc_id, 0.0) >= max(0.0, best_affinity * 0.88)
+                        and len(top_nodes.get(doc_id, {})) >= max(1, int(best_structure * 0.55))
+                    )
+                ][:2] or [selected_documents[0]]
+
+            if selected_documents:
+                chunk_stmt = (
+                    select(Chunk, Document)
+                    .join(Document, Document.id == Chunk.document_id)
+                    .where(
+                        document_access_clause(user),
+                        Document.ingestion_status == "ready",
+                        Chunk.document_id.in_(selected_documents),
+                    )
+                    .order_by(Chunk.document_id, Chunk.ordinal)
+                )
+                first_chunk_by_top: dict[tuple[UUID, str], tuple[Chunk, Document]] = {}
+                for chunk, document in self.db.execute(chunk_stmt).all():
+                    path = [str(value).strip() for value in (chunk.section_path or []) if str(value).strip()]
+                    if not path:
+                        continue
+                    key = (document.id, path[0])
+                    first_chunk_by_top.setdefault(key, (chunk, document))
+
+                for goal in structure_goals:
+                    structure_probes = list(dict.fromkeys([
+                        *goal.search_queries,
+                        *goal.entity_terms,
+                        goal.question,
+                    ]))
+                    for document_id in selected_documents:
+                        ordered_nodes = sorted(
+                            top_nodes.get(document_id, {}).items(),
+                            key=lambda item: (
+                                item[1].ordinal_from if item[1].ordinal_from is not None else 10**9,
+                                item[1].page_from if item[1].page_from is not None else 10**9,
+                            ),
+                        )
+                        # A parser can expose several top-level families in one PDF (for
+                        # example front matter, translated rules, annexures and chapters).
+                        # When the semantic goal names a structural family, keep the members
+                        # whose labels overlap that goal instead of blindly taking the first
+                        # N top-level nodes. This remains fully corpus/query driven.
+                        relevant_nodes = [
+                            item for item in ordered_nodes
+                            if max(
+                                (token_overlap(probe, item[0]) for probe in structure_probes),
+                                default=0.0,
+                            ) > 0.0
+                        ]
+                        if relevant_nodes:
+                            ordered_nodes = relevant_nodes
+                        for top_label, _node in ordered_nodes:
+                            row = first_chunk_by_top.get((document_id, top_label))
+                            if row is None:
+                                continue
+                            chunk, document = row
+                            if chunk.id in seen_chunks:
+                                candidate = None
+                            else:
+                                candidate = self._candidate(chunk, document)
+                                seen_chunks.add(chunk.id)
+                            if candidate is None:
+                                # The same representative can satisfy multiple structural
+                                # goals; attach attribution to the already emitted candidate.
+                                for existing in result:
+                                    if existing.chunk_id == chunk.id:
+                                        existing.sources.add(f"goal:{goal.id}")
+                                        existing.sources.add(f"goal:{goal.id}:document_structure")
+                                continue
+                            candidate.sources.update({
+                                "planned_structure",
+                                f"goal:{goal.id}",
+                                f"goal:{goal.id}:document_structure",
+                            })
+                            candidate.evidence_lane = "document_structure"
+                            candidate.rerank_score = max(candidate.rerank_score, 0.92)
+                            candidate.final_retrieval_score = max(candidate.final_retrieval_score, 0.92)
+                            candidate.rank_method = "planned_document_structure"
+                            result.append(candidate)
+                            if len(result) >= max_candidates:
+                                return result
+
+        # section_navigation: independently rank corpus section nodes using the semantic
+        # goal wording, then materialize original chunks from the best matching section.
+        for goal in structural_goals:
+            if "section_navigation" not in goal.retrieval_tools:
+                continue
+            probes = list(dict.fromkeys([
+                *goal.search_queries,
+                *goal.entity_terms,
+                goal.question,
+            ]))
+            for probe in probes[:2]:
+                try:
+                    discovery = self.discover_corpus(probe, user, structural_document_ids or document_ids)
+                except Exception:
+                    continue
+
+                discovery_dict = discovery.as_dict()
+                candidates: list[Candidate] = []
+                # When corpus intelligence identifies a hierarchy path, expand the most
+                # query-matching ancestor directly. This is generic hierarchical navigation:
+                # a request for a broad parent gets its descendants, while a specific child
+                # stays narrow. No document vocabulary is encoded in application code.
+                for raw_hit in discovery_dict.get("hits") or []:
+                    if not isinstance(raw_hit, dict) or raw_hit.get("node_type") != "section":
+                        continue
+                    try:
+                        hit_document_id = UUID(str(raw_hit.get("document_id")))
+                    except (TypeError, ValueError):
+                        continue
+                    path = [
+                        str(value).strip()
+                        for value in (raw_hit.get("section_path") or [])
+                        if str(value).strip()
+                    ]
+                    if not path:
+                        continue
+                    target_component = max(
+                        path,
+                        key=lambda value: token_overlap(probe, value),
+                    )
+                    if token_overlap(probe, target_component) <= 0.0:
+                        continue
+                    remaining = max(1, max_candidates - len(result))
+                    stmt = (
+                        select(Chunk, Document)
+                        .join(Document, Document.id == Chunk.document_id)
+                        .where(
+                            *self._base_filters(user, [hit_document_id]),
+                            Chunk.section_path.any(target_component),
+                        )
+                        .order_by(Chunk.ordinal)
+                        .limit(remaining)
+                    )
+                    rows = self.db.execute(stmt).all()
+                    if rows:
+                        candidates = [self._candidate(chunk, document) for chunk, document in rows]
+                        break
+
+                if not candidates:
+                    candidates = self.recover_corpus_section_context(
+                        discovery_dict,
+                        user,
+                        structural_document_ids or document_ids,
+                        goal_ids={goal.id},
+                    )
+                if not candidates:
+                    continue
+                for candidate in candidates:
+                    if candidate.chunk_id in seen_chunks:
+                        for existing in result:
+                            if existing.chunk_id == candidate.chunk_id:
+                                existing.sources.add(f"goal:{goal.id}")
+                                existing.sources.add(f"goal:{goal.id}:section_navigation")
+                        continue
+                    seen_chunks.add(candidate.chunk_id)
+                    candidate.sources.add("planned_section_navigation")
+                    candidate.sources.add(f"goal:{goal.id}")
+                    candidate.sources.add(f"goal:{goal.id}:section_navigation")
+                    candidate.evidence_lane = "section_navigation"
+                    candidate.rerank_score = max(candidate.rerank_score, 0.82)
+                    candidate.final_retrieval_score = max(candidate.final_retrieval_score, 0.82)
+                    candidate.rank_method = "planned_section_navigation"
+                    result.append(candidate)
+                    if len(result) >= max_candidates:
+                        return result
+                # One successful corpus-navigation probe is enough for this goal; avoid
+                # repeated embedding work unless the first probe produced no section.
+                break
+        return result
+
     def recover_corpus_section_context(
         self,
         discovery: dict | None,
@@ -2014,6 +2359,7 @@ class RetrievalEngine:
 
         queries: list[str] = []
         query_metadata: list[dict] = []
+        query_result_previews: list[dict] = []
         seen_queries: set[str] = set()
         for query in raw_queries:
             cleaned_query = query.strip()
@@ -2043,9 +2389,9 @@ class RetrievalEngine:
         protected_goal: list[Candidate] = []
         goal_candidate_ids: dict[str, set[UUID]] = defaultdict(set)
         goal_source_counts: dict[str, dict[str, int]] = defaultdict(lambda: defaultdict(int))
-        # Governing references are a bounded parallel lane only when the question is
-        # operational/regulatory. Injecting MRGR into HR/finance/policy lookups polluted top
-        # evidence and made unrelated answers look authoritative.
+        # Optional governing references are a bounded parallel lane only when the question
+        # is operational/regulatory. Injecting an unrelated configured rulebook into other
+        # domains can pollute top evidence, so this lane remains relevance-gated.
         overview_ids = (
             self._governing_document_ids(user, document_ids)
             if self._governing_lane_relevant(query_plan)
@@ -2476,6 +2822,36 @@ class RetrievalEngine:
                     ("routed_relaxed", routed_relaxed_candidates, max(1.0, self.settings.routed_document_boost)),
                     ("routed_section", routed_section_candidates, max(self.settings.routed_document_boost, self.settings.section_navigation_weight)),
                 )
+            debug_results: list[dict] = []
+            debug_seen: set[UUID] = set()
+            for source, candidates, _source_weight in sources:
+                for candidate in candidates[:3]:
+                    if candidate.chunk_id in debug_seen:
+                        continue
+                    debug_seen.add(candidate.chunk_id)
+                    debug_results.append({
+                        "source": source,
+                        "chunk_id": str(candidate.chunk_id),
+                        "document_id": str(candidate.document_id),
+                        "document_title": candidate.document_title,
+                        "page_from": candidate.page_from,
+                        "page_to": candidate.page_to,
+                        "section_path": list(candidate.section_path or []),
+                        "content_kind": candidate.content_kind,
+                    })
+                    if len(debug_results) >= 12:
+                        break
+                if len(debug_results) >= 12:
+                    break
+            query_result_previews.append({
+                "query_index": query_index,
+                "query": query,
+                "goal_ids": query_goal_ids,
+                "goal_kinds": list(query_meta.get("goal_kinds") or []),
+                "origins": list(query_meta.get("origins") or []),
+                "results": debug_results,
+            })
+
             for source, candidates, source_weight in sources:
                 key = f"q{query_index}:{source}"
                 source_counts[key] = len(candidates)
@@ -3424,6 +3800,7 @@ class RetrievalEngine:
                 {"text": query, **query_metadata[index]}
                 for index, query in enumerate(queries)
             ],
+            "query_result_previews": query_result_previews,
             "profile": profile,
             "source_stage": source_stage,
             "compositional": bool(evidence_plan and evidence_plan.requires_decomposition),

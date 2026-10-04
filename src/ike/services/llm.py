@@ -148,6 +148,16 @@ class LLMClient:
             text = match.group(1).strip()
         try:
             return json.loads(text), result
-        except json.JSONDecodeError as exc:
+        except json.JSONDecodeError:
+            # Some models occasionally prepend/append a tiny amount of prose despite JSON
+            # mode. Recover the outermost JSON object before giving up.
+            start = text.find("{")
+            end = text.rfind("}")
+            if start >= 0 and end > start:
+                candidate = text[start : end + 1]
+                try:
+                    return json.loads(candidate), result
+                except json.JSONDecodeError:
+                    pass
             logger.warning("llm_json_parse_failed", extra={"payload": text[:1000]})
-            raise ValueError("Model returned invalid JSON") from exc
+            raise ValueError("Model returned invalid JSON")

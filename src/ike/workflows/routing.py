@@ -53,7 +53,7 @@ _FROM_SOURCE_SCOPE_TAIL_RE = re.compile(
     re.IGNORECASE,
 )
 _SOURCE_KEYWORD_RE = re.compile(
-    r"\b(?:manual|handbook|rule|rules|policy|circular|instruction|sop|otm|swo|mrgr|adm|"
+    r"\b(?:manual|handbook|rule|rules|policy|circular|instruction|sop|otm|swo|"
     r"compendium|document|file|source|guideline|standard|act|regulation|code)\b",
     re.IGNORECASE,
 )
@@ -72,7 +72,7 @@ def extract_source_scope(question: str) -> str | None:
         source = re.sub(r"\s+", " ", match.group("source")).strip(" ,;:-")
         # "as per pay scale/designation" and similar qualifiers are applicability clauses,
         # not document names. Only promote a tail to source scope when it looks like a named
-        # documentary source (MRGR, ADM, handbook, policy, business rule, etc.).
+        # documentary source (acronym, handbook, policy, rulebook, etc.).
         if not _looks_like_source_name(source):
             return None
         return source

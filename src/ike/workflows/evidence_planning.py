@@ -56,6 +56,17 @@ _ALLOWED_STRATEGIES = {
     "procedure",
     "overview",
 }
+_ALLOWED_RETRIEVAL_TOOLS = {
+    "search",
+    "document_structure",
+    "section_navigation",
+    "table_search",
+    "exact_lookup",
+}
+_ALLOWED_ANSWER_SHAPES = {
+    "fact", "scalar", "definition", "procedure", "enumeration", "comparison",
+    "relationship", "calculation", "synthesis",
+}
 
 
 class SemanticEvidenceGoalPayload(BaseModel):
@@ -71,6 +82,7 @@ class SemanticEvidenceGoalPayload(BaseModel):
     qualifiers: list[str] = Field(default_factory=list, max_length=8)
     relation: str | None = None
     coverage_contract: str = "single_fact"
+    retrieval_tools: list[str] = Field(default_factory=list, max_length=5)
 
 
 class SemanticEvidencePlanPayload(BaseModel):
@@ -82,6 +94,9 @@ class SemanticEvidencePlanPayload(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
+    interpretation: str = ""
+    answer_shape: str = "fact"
+    source_hints: list[str] = Field(default_factory=list, max_length=6)
     strategy: str = "single"
     entities: list[str] = Field(default_factory=list, max_length=12)
     needs_research: bool = False
@@ -102,6 +117,9 @@ class GoalAuditRowPayload(BaseModel):
 class GoalAuditPayload(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
+    plan_aligned: bool = True
+    plan_issue: str = ""
+    replan_needed: bool = False
     goals: list[GoalAuditRowPayload] = Field(default_factory=list, max_length=12)
 
 
@@ -236,8 +254,13 @@ class EvidenceGoal:
     qualifiers: list[str] = field(default_factory=list)
     relation: str | None = None
     coverage_contract: str = "single_fact"
+    retrieval_tools: list[str] = field(default_factory=list)
 
     def __post_init__(self) -> None:
+        self.retrieval_tools = [
+            item for item in dict.fromkeys(str(value).strip().casefold() for value in self.retrieval_tools)
+            if item in _ALLOWED_RETRIEVAL_TOOLS
+        ] or ["search"]
         if self.coverage_contract == "single_fact":
             self.coverage_contract = _default_coverage_contract(self.kind)
         if self.coverage_contract not in _ALLOWED_COVERAGE_CONTRACTS:
@@ -254,6 +277,7 @@ class EvidenceGoal:
             f"Relation: {self.relation or 'none'}\n"
             f"Dependencies: {dependencies}\n"
             f"Coverage contract: {self.coverage_contract}\n"
+            f"Retrieval tools: {', '.join(self.retrieval_tools) or 'search'}\n"
             f"Qualifiers/conditions: {qualifiers}"
         )
 
@@ -261,6 +285,9 @@ class EvidenceGoal:
 @dataclass(slots=True)
 class EvidencePlan:
     original: str
+    interpretation: str = ""
+    answer_shape: str = "fact"
+    source_hints: list[str] = field(default_factory=list)
     strategy: str = "single"
     entities: list[str] = field(default_factory=list)
     goals: list[EvidenceGoal] = field(default_factory=list)
@@ -277,6 +304,9 @@ class EvidencePlan:
     def prompt_block(self) -> str:
         goals = "\n\n".join(goal.prompt_block() for goal in self.goals) or "No explicit goals."
         return (
+            f"Interpretation: {self.interpretation or self.original}\n"
+            f"Answer shape: {self.answer_shape}\n"
+            f"Source hints: {', '.join(self.source_hints) or 'none'}\n"
             f"Strategy: {self.strategy}\n"
             f"Planner source: {self.planner_source}\n"
             f"Requires decomposition: {'yes' if self.requires_decomposition else 'no'}\n"
@@ -305,6 +335,9 @@ class GoalSatisfaction:
     partial_goal_ids: list[str] = field(default_factory=list)
     contradicted_goal_ids: list[str] = field(default_factory=list)
     audit_source: str = "deterministic"
+    plan_aligned: bool = True
+    plan_issue: str = ""
+    replan_needed: bool = False
 
     def as_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -1599,7 +1632,7 @@ def should_use_semantic_planner(question: str, query_plan: QueryPlan, plan: Evid
         return False
 
     # A bounded definition lookup is a structural retrieval problem, including formulations
-    # such as "definition of Incident as per MRGR".  Source scope is handled separately by
+    # scoped to a named manual or rulebook. Source scope is handled separately by
     # retrieval and must not trigger an LLM planning detour.
     if query_plan.intent == "definition" and query_plan.lookup_term:
         return False
@@ -1694,7 +1727,9 @@ def should_repair_with_semantic_planner(question: str, query_plan: QueryPlan, pl
 
 def semantic_planner_system_prompt(max_goals: int, max_queries_per_goal: int) -> str:
     return (
-        "You are an evidence-planning component for an internal-document retrieval system. "
+        "You are the primary semantic interpreter and evidence-planning component for an internal-document retrieval system. "
+        "Infer what the user actually wants from the full natural-language request before choosing search terms. "
+        "Do not mechanically map words such as what, how many, chapter, list, rate, or where to a fixed intent; infer their meaning in context. "
         "Do NOT answer the user's question and do NOT use your own domain knowledge to decide facts. "
         "Decompose the request into atomic evidence requirements that can be independently searched and verified. "
         "Use the fewest goals that fully cover the explicit asks: normally one goal per requested sub-question or required calculation input group. Do not create extra authority, approval, governance, conflict, or ownership goals unless the user asked for them or they are strictly necessary to validate an explicit condition. "
@@ -1705,6 +1740,8 @@ def semantic_planner_system_prompt(max_goals: int, max_queries_per_goal: int) ->
         "For several terms, never require all terms to co-occur merely to establish each term individually. "
         "A relationship goal must seek evidence of the relationship itself; separate definitions do not prove a relationship. "
         "Search queries are SEARCH-ONLY hypotheses, never evidence. They may paraphrase the user and may hypothesize likely section-heading vocabulary, role/function terminology, governing concepts, procedural nouns, synonyms, and alternate expressions of the requested relation. Such hypotheses must never be treated as facts unless retrieved evidence supports them. "
+        "Identify source_hints only from a document/manual/rulebook/source name explicitly present in the user's wording. Do not copy candidate document titles, revisions, years, or filenames from corpus hints into source_hints unless those same substantive tokens were written by the user. Corpus hints may still inform search_queries, but source_hints can become hard source selectors and therefore require literal user grounding. "
+        "Choose retrieval_tools per goal from search, document_structure, section_navigation, table_search, exact_lookup. Use document_structure when the request needs a document hierarchy or complete top-level structure; section_navigation when the user asks for a named part/section/chapter or content inside one; otherwise use search unless another tool clearly fits. These are retrieval actions, not domain rules. "
         "When the query budget permits, make a goal's probes complementary rather than near-duplicates: include a literal/normalized probe, a relation-explicit probe that states the requested subject-predicate-object meaning, and a likely document-vocabulary/heading/role probe. Do not merely change tense, pluralization, punctuation, or word order. "
         "Do not invent numeric thresholds, acronym expansions, technical identifiers, places, or factual outcomes. "
         "The user may write in any language or mix languages. Preserve the original literal terms; for non-English prose you may additionally provide a concise English translation as a retrieval hypothesis when useful, but never translate or expand technical identifiers by guessing. "
@@ -1712,12 +1749,22 @@ def semantic_planner_system_prompt(max_goals: int, max_queries_per_goal: int) ->
     )
 
 
-def semantic_planner_user_prompt(question: str, deterministic: EvidencePlan) -> str:
+def semantic_planner_user_prompt(question: str, deterministic: EvidencePlan | None = None) -> str:
+    seed = (
+        "Fallback parser output (safety fallback only; it may be semantically wrong and must not override your interpretation):\n"
+        + deterministic.prompt_block()
+        + "\n\n"
+        if deterministic is not None
+        else ""
+    )
     return (
         f"User question:\n{question}\n\n"
-        f"Safe deterministic seed plan:\n{deterministic.prompt_block()}\n\n"
-        "Return JSON with this schema:\n"
+        + seed
+        + "Return JSON with this schema:\n"
         "{\n"
+        '  "interpretation": "concise statement of what the user actually wants",\n'
+        '  "answer_shape": "fact|scalar|definition|procedure|enumeration|comparison|relationship|calculation|synthesis",\n'
+        '  "source_hints": ["named source/document grounded in user wording or corpus hints", ...],\n'
         '  "strategy": "single|multi_lookup|multi_entity|comparison|relationship|conditional|multi_hop|claim_check|enumeration|procedure|overview",\n'
         '  "entities": ["literal user-grounded entity/term", ...],\n'
         '  "needs_research": true|false,\n'
@@ -1733,11 +1780,13 @@ def semantic_planner_user_prompt(question: str, deterministic: EvidencePlan) -> 
         '      "depends_on": ["gX", ...],\n'
         '      "qualifiers": ["explicit user condition/negation/time qualifier", ...],\n'
         '      "relation": "short relation label or null",\n'
-        '      "coverage_contract": "single_fact|primary_definition|all_supported_variants|enumerate_set|ordered_procedure|all_requested_entities|relationship_proof|conditional_rule|calculation_inputs|compare_variants"\n'
+        '      "coverage_contract": "single_fact|primary_definition|all_supported_variants|enumerate_set|ordered_procedure|all_requested_entities|relationship_proof|conditional_rule|calculation_inputs|compare_variants|authority_proof|scalar_with_condition",\n'
+        '      "retrieval_tools": ["search", "section_navigation"]\n'
         "    }\n"
         "  ]\n"
         "}\n"
         "Every required part of the user's request must appear in at least one required goal. "
+        "Prefer the semantic relationship expressed by the sentence over splitting uppercase tokens or grammatical fragments into unrelated goals. "
         "Do not add a goal for an issue the user did not ask about unless it is necessary to validate a stated condition or relationship."
     )
 
@@ -1755,6 +1804,26 @@ def _anchored_entity(value: str, original_words: set[str]) -> bool:
     if not substantive:
         return False
     return any(token in original_words for token in substantive)
+
+
+def _anchored_source_hint(value: str, original_words: set[str]) -> bool:
+    """Require hard-scope source hints to be grounded in the user's own wording.
+
+    Corpus-discovery titles are useful search/routing hypotheses, but copying a derivative
+    document title into ``source_hints`` can accidentally hard-scope retrieval to a document
+    the user never named. Generated source qualifiers therefore remain soft corpus hints;
+    only literal user-grounded source tokens may become hard source selectors.
+    """
+
+    generic_source_words = {
+        "the", "a", "an", "document", "file", "pdf", "manual", "handbook",
+        "rulebook", "rules", "book", "source", "version", "revision",
+    }
+    tokens = [token.casefold() for token in _word_tokens(value)]
+    substantive = [token for token in tokens if token not in generic_source_words]
+    if not substantive:
+        return False
+    return all(token in original_words for token in substantive)
 
 
 def _safe_generated_query(value: str, original_identifiers: set[str], original_numbers: set[str]) -> bool:
@@ -1777,8 +1846,15 @@ def evidence_plan_from_payload(
     *,
     max_goals: int = 8,
     max_queries_per_goal: int = 3,
+    preserve_fallback_semantics: bool = True,
 ) -> EvidencePlan:
-    """Validate/sanitize an LLM evidence plan and merge safety-critical seed goals."""
+    """Validate/sanitize an LLM evidence plan.
+
+    preserve_fallback_semantics keeps the legacy deterministic seed-merging behavior for
+    compatibility callers. Primary semantic planning disables it so parser guesses cannot
+    silently override the model's interpretation; the deterministic plan remains only a
+    fail-open fallback if structured planning fails.
+    """
 
     if not isinstance(payload, dict):
         fallback.warnings.append("semantic_planner_invalid_payload")
@@ -1786,6 +1862,17 @@ def evidence_plan_from_payload(
 
     original_words, original_identifiers, original_numbers = _original_token_sets(question)
     warnings: list[str] = []
+
+    interpretation = re.sub(r"\s+", " ", str(payload.get("interpretation") or "").strip())[:800]
+    answer_shape = str(payload.get("answer_shape") or "fact").strip().casefold()
+    if answer_shape not in _ALLOWED_ANSWER_SHAPES:
+        answer_shape = "fact"
+        warnings.append("invalid_answer_shape_replaced")
+    raw_source_hints = payload.get("source_hints") if isinstance(payload.get("source_hints"), list) else []
+    source_hints = _unique(
+        (str(item) for item in raw_source_hints if _anchored_source_hint(str(item), original_words)),
+        limit=6,
+    )
 
     strategy = str(payload.get("strategy") or fallback.strategy).strip().casefold()
     if strategy not in _ALLOWED_STRATEGIES:
@@ -1796,9 +1883,12 @@ def evidence_plan_from_payload(
     entities = _unique(
         str(item) for item in raw_entities if _anchored_entity(str(item), original_words)
     )
-    # Preserve explicit identifiers and deterministic entity extraction if the semantic
-    # planner omitted them.
-    entities = _unique([*entities, *fallback.entities], limit=12)
+    # Compatibility callers may preserve deterministic entities. Primary semantic
+    # planning intentionally prevents parser guesses from altering the model's meaning.
+    if preserve_fallback_semantics:
+        entities = _unique([*entities, *fallback.entities], limit=12)
+    else:
+        entities = _unique(entities, limit=12)
 
     raw_goals = payload.get("goals") if isinstance(payload.get("goals"), list) else []
     goals: list[EvidenceGoal] = []
@@ -1854,6 +1944,12 @@ def evidence_plan_from_payload(
         if coverage_contract not in _ALLOWED_COVERAGE_CONTRACTS:
             coverage_contract = _default_coverage_contract(kind)
             warnings.append(f"{goal_id}:invalid_coverage_contract_replaced")
+        raw_tools = raw.get("retrieval_tools") if isinstance(raw.get("retrieval_tools"), list) else []
+        retrieval_tools = [
+            value
+            for value in dict.fromkeys(str(item).strip().casefold() for item in raw_tools)
+            if value in _ALLOWED_RETRIEVAL_TOOLS
+        ] or ["search"]
         goals.append(
             EvidenceGoal(
                 id=goal_id,
@@ -1866,6 +1962,7 @@ def evidence_plan_from_payload(
                 qualifiers=qualifiers,
                 relation=relation,
                 coverage_contract=coverage_contract,
+                retrieval_tools=retrieval_tools,
             )
         )
 
@@ -1873,7 +1970,7 @@ def evidence_plan_from_payload(
         fallback.warnings.append("semantic_planner_no_valid_goals")
         return fallback
 
-    if "policy_entitlement_plan" in fallback.warnings:
+    if preserve_fallback_semantics and "policy_entitlement_plan" in fallback.warnings:
         # Semantic repair may paraphrase all probes back into the employee's wording.
         # Preserve one deterministic institutional-vocabulary bridge per matching goal kind.
         # These are search-only hypotheses and remain subject to evidence verification.
@@ -1902,7 +1999,7 @@ def evidence_plan_from_payload(
     }
     next_id = 1
     used_ids = {goal.id for goal in goals}
-    for seed in fallback.goals:
+    for seed in (fallback.goals if preserve_fallback_semantics else []):
         seed_identifiers = {term.casefold() for term in seed.entity_terms} & original_identifiers
         if seed_identifiers and not seed_identifiers.issubset(covered_identifier_terms):
             while f"g{next_id}" in used_ids:
@@ -1935,7 +2032,7 @@ def evidence_plan_from_payload(
         goal.id: " ".join([goal.question, *goal.search_queries, *goal.entity_terms])
         for goal in goals
     }
-    for seed in fallback.goals:
+    for seed in (fallback.goals if preserve_fallback_semantics else []):
         if not seed.required or len(goals) >= max_goals:
             continue
         seed_source = " ".join(seed.search_queries or [seed.question])
@@ -1981,6 +2078,9 @@ def evidence_plan_from_payload(
     }
     return EvidencePlan(
         original=question,
+        interpretation=interpretation,
+        answer_shape=answer_shape,
+        source_hints=source_hints,
         strategy=strategy,
         entities=entities,
         goals=goals[:max_goals],
@@ -1988,7 +2088,7 @@ def evidence_plan_from_payload(
         needs_research=bool(payload.get("needs_research", True)) or requires_decomposition,
         needs_verification=bool(payload.get("needs_verification", True)) or requires_decomposition,
         planner_source="semantic",
-        warnings=[*fallback.warnings, *warnings],
+        warnings=[*(fallback.warnings if preserve_fallback_semantics else []), *warnings],
     )
 
 
@@ -2108,8 +2208,9 @@ def satisfaction_from_trace(plan: EvidencePlan, trace: dict[str, Any]) -> GoalSa
 
 def goal_audit_system_prompt() -> str:
     return (
-        "You are a strict evidence-satisfaction auditor. Do not answer the user's question. "
-        "For each evidence goal, decide whether the supplied evidence actually supports that goal. "
+        "You are a strict plan-alignment and evidence-satisfaction auditor. Do not answer the user's question. "
+        "First decide whether the evidence plan actually represents the user's original information need. A plan can be wrong even when evidence supports its own goals. If the plan is solving a different task, omits a requested relationship/part, or mistakes document navigation for a definition/constraint/lookup, set plan_aligned=false and replan_needed=true. "
+        "Then, for each evidence goal, decide whether the supplied evidence actually supports that goal. "
         "Use only the supplied evidence IDs. Co-occurrence of terms does not prove a relationship, causation, override, eligibility, entitlement, or applicability. "
         "Separate definitions do not prove that two things interact. A premise stated by the user is not evidence. "
         "Respect each goal's coverage contract. For all_supported_variants/enumerate_set/ordered_procedure/all_requested_entities/compare_variants, one matching passage is not automatically complete when the retrieved evidence indicates additional materially distinct meanings, values, steps, entities, scopes, or variants. Mark supported only when the evidence directly establishes the requested proposition and satisfies the stated coverage contract. "
@@ -2122,9 +2223,10 @@ def goal_audit_user_prompt(question: str, plan: EvidencePlan, evidence_text: str
     return (
         f"User question:\n{question}\n\nEvidence plan:\n{plan.prompt_block()}\n\n"
         f"Retrieved evidence:\n{evidence_text}\n\n"
-        "Return JSON {\"goals\": [{\"goal_id\": \"g1\", \"status\": \"supported|partial|missing|contradicted\", "
+        "Return JSON {\"plan_aligned\": true|false, \"plan_issue\": \"short reason or empty\", \"replan_needed\": true|false, "
+        "\"goals\": [{\"goal_id\": \"g1\", \"status\": \"supported|partial|missing|contradicted\", "
         "\"evidence_ids\": [\"E1\"], \"reason\": \"short evidence-based reason\", \"recovery_queries\": [\"...\"]}]}. "
-        "Return one entry for every plan goal."
+        "Return one entry for every plan goal. Do not mark plan_aligned=true merely because the evidence supports the current goals; compare the plan to the original user question."
     )
 
 
@@ -2216,10 +2318,29 @@ def goal_satisfaction_from_payload(
             else:
                 contradicted.append(goal.id)
 
+    plan_aligned = bool(payload.get("plan_aligned", True))
+    plan_issue = re.sub(r"\s+", " ", str(payload.get("plan_issue") or "").strip())[:600]
+    replan_needed = bool(payload.get("replan_needed", False)) or not plan_aligned
+    if replan_needed:
+        # Evidence can perfectly support the wrong task. Force one semantic replan by
+        # marking otherwise-supported required goals partial; recovery will replace the
+        # contract rather than blindly searching harder for the misinterpreted plan.
+        for status in statuses:
+            goal = by_id.get(status.goal_id)
+            if goal is None or not goal.required or status.status != "supported":
+                continue
+            status.status = "partial"
+            status.reason = (
+                "The current evidence may support this goal, but the semantic audit found "
+                "that the plan does not fully represent the user's request. " + plan_issue
+            ).strip()
+            if status.goal_id not in partial:
+                partial.append(status.goal_id)
+
     # A directly contradicted claim-check goal is considered resolved (the answer should
-    # explain the correction). Contradicted relationship/fact goals are also evidenceful,
-    # but verification remains mandatory. Missing/partial goals are what trigger recovery.
-    complete = not missing and not partial
+    # explain the correction). Missing/partial goals or a plan-alignment failure trigger
+    # recovery/replanning.
+    complete = not missing and not partial and not replan_needed
     return GoalSatisfaction(
         complete=complete,
         statuses=statuses,
@@ -2227,6 +2348,9 @@ def goal_satisfaction_from_payload(
         partial_goal_ids=partial,
         contradicted_goal_ids=contradicted,
         audit_source="semantic",
+        plan_aligned=plan_aligned,
+        plan_issue=plan_issue,
+        replan_needed=replan_needed,
     )
 
 

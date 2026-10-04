@@ -142,7 +142,7 @@ def retrieval_quality_issues(
 
     anchors = _query_anchors(question)
     if query_plan.intent == "definition" and query_plan.lookup_term:
-        # Source-scope words (for example MRGR in "definition of Incident as per MRGR")
+        # Source-scope words (for example a named rulebook in a scoped definition request)
         # identify the document family; they need not be repeated inside the definition
         # chunk itself.  The structural definition path already enforces source scope.
         lookup_words = {

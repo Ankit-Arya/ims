@@ -4,15 +4,17 @@ import queue
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from fastapi.responses import StreamingResponse
+from fastapi.responses import Response, StreamingResponse
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from ike.api.deps import get_current_user
 from ike.db.models import Feedback, QueryLog, User
+from ike.core.config import get_settings
 from ike.db.session import SessionLocal, get_db
 from ike.schemas.query import FeedbackRequest, QueryHistoryItem, QueryRequest, QueryResponse
 from ike.services.query_admission import QueryCapacityError, query_admission
+from ike.services.query_debug import build_query_debug_report, debug_report_markdown
 from ike.services.query_execution import execute_query
 from ike.services.query_control import QueryCancelled, QueryControl
 from ike.services.inference_client import InferenceClient
@@ -145,6 +147,41 @@ def ask_stream(payload: QueryRequest, user: User = Depends(get_current_user)) ->
 
 
 
+
+@router.get("/{query_id}/debug")
+def download_query_debug(
+    query_id: UUID,
+    format: str = Query(default="markdown", pattern="^(markdown|json)$"),
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> Response:
+    settings = get_settings()
+    if not settings.query_debug_download_enabled:
+        raise HTTPException(status_code=404, detail="Query diagnostics are disabled.")
+
+    query_log = db.get(QueryLog, query_id)
+    if query_log is None:
+        raise HTTPException(status_code=404, detail="Query not found.")
+    if query_log.user_id != user.id and user.role != "admin":
+        raise HTTPException(status_code=403, detail="You may only download diagnostics for your own queries.")
+
+    report = build_query_debug_report(db, user, query_log)
+    if format == "json":
+        body = json.dumps(report, ensure_ascii=False, indent=2, default=str)
+        filename = f"ims-query-debug-{query_id}.json"
+        media_type = "application/json"
+    else:
+        body = debug_report_markdown(report)
+        filename = f"ims-query-debug-{query_id}.md"
+        media_type = "text/markdown; charset=utf-8"
+
+    return Response(
+        content=body,
+        media_type=media_type,
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
 @router.post("/{request_id}/cancel")
 def cancel_query(request_id: UUID, user: User = Depends(get_current_user)) -> dict:
     # Cancellation is scoped to an opaque request UUID. It does not expose data and can be
@@ -186,6 +223,7 @@ def query_history(
                 latency_ms=row.latency_ms,
                 input_tokens=row.input_tokens or 0,
                 output_tokens=row.output_tokens or 0,
+                debug_download_available=get_settings().query_debug_download_enabled,
                 created_at=row.created_at,
             )
         )

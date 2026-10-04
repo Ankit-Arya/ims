@@ -102,6 +102,87 @@ def test_lowercase_single_term_is_still_an_atomic_term_goal():
     assert plan.goals[0].entity_terms == ["overtime"]
 
 
+def test_primary_semantic_plan_replaces_wrong_deterministic_constraint_with_structure_goal():
+    question = "How many parts are there in RULEBOOK and name them"
+    fallback = evidence_plan(question)
+    assert any(goal.kind == "attribute" for goal in fallback.goals)
+
+    payload = {
+        "interpretation": "Count and name the top-level parts in the named rulebook.",
+        "answer_shape": "enumeration",
+        "source_hints": ["RULEBOOK"],
+        "strategy": "enumeration",
+        "entities": ["RULEBOOK"],
+        "needs_research": True,
+        "needs_verification": True,
+        "goals": [
+            {
+                "id": "g1",
+                "kind": "enumeration",
+                "question": "Identify the complete top-level part structure in RULEBOOK.",
+                "search_queries": ["RULEBOOK parts", "RULEBOOK contents headings"],
+                "entity_terms": ["RULEBOOK"],
+                "required": True,
+                "coverage_contract": "enumerate_set",
+                "retrieval_tools": ["document_structure"],
+            }
+        ],
+    }
+    plan = evidence_plan_from_payload(
+        question,
+        payload,
+        fallback,
+        preserve_fallback_semantics=False,
+    )
+
+    assert plan.planner_source == "semantic"
+    assert plan.answer_shape == "enumeration"
+    assert plan.source_hints == ["RULEBOOK"]
+    assert len(plan.required_goals) == 1
+    assert plan.required_goals[0].kind == "enumeration"
+    assert plan.required_goals[0].coverage_contract == "enumerate_set"
+    assert plan.required_goals[0].retrieval_tools == ["document_structure"]
+    assert all(goal.kind != "attribute" for goal in plan.required_goals)
+
+
+def test_primary_semantic_plan_preserves_source_section_relationship_instead_of_identifier_split():
+    question = "Show part VII of RULEBOOK"
+    fallback = evidence_plan(question)
+    payload = {
+        "interpretation": "Show the requested part inside the named source.",
+        "answer_shape": "synthesis",
+        "source_hints": ["RULEBOOK"],
+        "strategy": "single",
+        "entities": ["part VII", "RULEBOOK"],
+        "needs_research": True,
+        "needs_verification": True,
+        "goals": [
+            {
+                "id": "g1",
+                "kind": "overview",
+                "question": "Retrieve and explain part VII from RULEBOOK.",
+                "search_queries": ["part VII RULEBOOK", "RULEBOOK part VII"],
+                "entity_terms": ["part VII", "RULEBOOK"],
+                "required": True,
+                "relation": "part_of_source",
+                "coverage_contract": "enumerate_set",
+                "retrieval_tools": ["section_navigation"],
+            }
+        ],
+    }
+    plan = evidence_plan_from_payload(
+        question,
+        payload,
+        fallback,
+        preserve_fallback_semantics=False,
+    )
+
+    assert len(plan.required_goals) == 1
+    assert plan.required_goals[0].relation == "part_of_source"
+    assert plan.required_goals[0].retrieval_tools == ["section_navigation"]
+    assert plan.source_hints == ["RULEBOOK"]
+
+
 def test_semantic_planner_cannot_introduce_new_identifier_or_number_in_search_query():
     question = "If the primary pump stops then the backup system starts; what action is required?"
     fallback = evidence_plan(question)
@@ -149,6 +230,45 @@ def test_semantic_planner_omission_does_not_silently_drop_user_clause():
     assert "backup valve" in joined
     assert "pump trips" in joined
     assert "preserved_omitted_user_clause_goal" in plan.warnings
+
+
+def test_goal_audit_forces_replan_when_evidence_supports_the_wrong_plan():
+    plan = EvidencePlan(
+        original="Explain the requested section in RULEBOOK",
+        interpretation="Define RULEBOOK",
+        goals=[EvidenceGoal(
+            id="g1", kind="definition", question="Define RULEBOOK",
+            search_queries=["RULEBOOK definition"], entity_terms=["RULEBOOK"], required=True,
+        )],
+        needs_verification=True,
+        planner_source="semantic",
+    )
+    fallback = GoalSatisfaction(
+        complete=True,
+        statuses=[GoalStatus(goal_id="g1", status="supported", evidence_ids=["E1"])],
+        audit_source="deterministic",
+    )
+    result = goal_satisfaction_from_payload(
+        plan,
+        {
+            "plan_aligned": False,
+            "plan_issue": "The user asked for content inside a section, not a source definition.",
+            "replan_needed": True,
+            "goals": [{
+                "goal_id": "g1", "status": "supported", "evidence_ids": ["E1"],
+                "reason": "The evidence defines the source.", "recovery_queries": [],
+            }],
+        },
+        valid_evidence_ids={"E1"},
+        valid_evidence_ids_by_goal={"g1": {"E1"}},
+        fallback=fallback,
+    )
+
+    assert result.complete is False
+    assert result.plan_aligned is False
+    assert result.replan_needed is True
+    assert result.partial_goal_ids == ["g1"]
+    assert result.statuses[0].status == "partial"
 
 
 def test_goal_audit_cannot_mark_supported_without_real_evidence_id():

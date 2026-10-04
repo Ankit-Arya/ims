@@ -60,6 +60,7 @@ class QueryResponse(BaseModel):
     latency_ms: int
     input_tokens: int = 0
     output_tokens: int = 0
+    debug_download_available: bool = False
 
 
 class QueryHistoryItem(QueryResponse):

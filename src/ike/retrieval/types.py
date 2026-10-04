@@ -42,7 +42,11 @@ class Evidence:
         if self.candidate.page_to and self.candidate.page_to != self.candidate.page_from:
             page = f"{page}-{self.candidate.page_to}"
         section_path = [str(item).strip() for item in (self.candidate.section_path or []) if str(item).strip()]
-        section = section_path[-1] if section_path else "Unsectioned"
+        section = (
+            " > ".join(section_path)
+            if section_path and self.candidate.evidence_lane in {"document_structure", "section_navigation"}
+            else section_path[-1] if section_path else "Unsectioned"
+        )
         normalized_local = section.casefold().strip(" .:-_()[]{}")
         generic_local = (
             normalized_local in {"note", "notes", "enclosure", "enclosures", "annexure", "appendix", "table"}

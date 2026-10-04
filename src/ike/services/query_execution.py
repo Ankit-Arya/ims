@@ -1,12 +1,15 @@
 import time
 from collections.abc import Callable
 from dataclasses import asdict, is_dataclass
+import logging
 from uuid import UUID
 
 from fastapi import HTTPException
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from ike.agent.controller import AgenticQAService
+from ike.core.config import get_settings
 from ike.db.models import Document, QueryLog, User
 from ike.retrieval.access import document_access_clause
 from ike.schemas.query import Citation, QueryRequest, QueryResponse
@@ -17,6 +20,8 @@ from ike.workflows.qa_graph import QAGraphService
 ProgressFn = Callable[[str, str, str, int], None]
 AnswerDeltaFn = Callable[[str], None]
 CancelCheckFn = Callable[[], None]
+
+logger = logging.getLogger(__name__)
 
 
 def _validate_scope(db: Session, user: User, document_ids: list[UUID] | None) -> None:
@@ -50,20 +55,69 @@ def execute_query(
     started = time.perf_counter()
     if cancel_check:
         cancel_check()
-    workflow = QAGraphService(
-        db, user, progress=progress, answer_delta=answer_delta, cancel_check=cancel_check,
-        request_id=str(payload.request_id),
+    settings = get_settings()
+    operational_context = (
+        payload.operational_context.model_dump(exclude_none=True)
+        if payload.operational_context
+        else {}
     )
-    # Keep retrieval semantics clean. Real-Time context is carried as structured state,
-    # not concatenated into the text that is embedded/searched.
-    workflow_question = payload.question
-    state = workflow.run(
-        workflow_question,
-        "direct" if payload.experience == "realtime" else payload.mode,
-        payload.document_ids,
-        experience=payload.experience,
-        operational_context=(payload.operational_context.model_dump(exclude_none=True) if payload.operational_context else {}),
-    )
+    state: dict
+    if settings.agentic_qa_enabled and payload.experience == "qa":
+        try:
+            agent = AgenticQAService(
+                db,
+                user,
+                progress=progress,
+                answer_delta=answer_delta,
+                cancel_check=cancel_check,
+                request_id=str(payload.request_id),
+            )
+            state = agent.run(
+                payload.question,
+                payload.mode,
+                payload.document_ids,
+                experience=payload.experience,
+                operational_context=operational_context,
+            )
+        except Exception as exc:
+            if not settings.agentic_qa_fallback_enabled:
+                raise
+            logger.exception("agentic_qa_failed_falling_back")
+            workflow = QAGraphService(
+                db,
+                user,
+                progress=progress,
+                answer_delta=answer_delta,
+                cancel_check=cancel_check,
+                request_id=str(payload.request_id),
+            )
+            state = workflow.run(
+                payload.question,
+                payload.mode,
+                payload.document_ids,
+                experience=payload.experience,
+                operational_context=operational_context,
+            )
+            trace = dict(state.get("retrieval_trace", {}))
+            trace["agentic_fallback"] = True
+            trace["agentic_fallback_error"] = type(exc).__name__
+            state["retrieval_trace"] = trace
+    else:
+        workflow = QAGraphService(
+            db,
+            user,
+            progress=progress,
+            answer_delta=answer_delta,
+            cancel_check=cancel_check,
+            request_id=str(payload.request_id),
+        )
+        state = workflow.run(
+            payload.question,
+            "direct" if payload.experience == "realtime" else payload.mode,
+            payload.document_ids,
+            experience=payload.experience,
+            operational_context=operational_context,
+        )
     latency_ms = int((time.perf_counter() - started) * 1000)
 
     by_id = {e.evidence_id: e for e in state.get("evidence", [])}
@@ -123,6 +177,8 @@ def execute_query(
             "goal_satisfaction": asdict(goal_satisfaction) if goal_satisfaction is not None and is_dataclass(goal_satisfaction) else trace.get("goal_satisfaction"),
             "recovery_attempted": bool(state.get("recovery_attempted", False)),
             "answer_plan": asdict(answer_plan) if answer_plan is not None and is_dataclass(answer_plan) else None,
+            "corpus_discovery": state.get("corpus_discovery"),
+            "okf_resolution": state.get("okf_resolution"),
             "source_policy": (
                 source_policy.as_dict()
                 if source_policy is not None and hasattr(source_policy, "as_dict")
@@ -180,4 +236,5 @@ def execute_query(
         latency_ms=latency_ms,
         input_tokens=state.get("input_tokens", 0),
         output_tokens=state.get("output_tokens", 0),
+        debug_download_available=get_settings().query_debug_download_enabled,
     )

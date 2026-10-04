@@ -317,12 +317,13 @@ function finishProgress(article) {
   if (bar) bar.style.width = '100%';
 }
 
-function answerToolbar(mode, confidence, latency, createdAt) {
+function answerToolbar(mode, confidence, latency, createdAt, queryId = null, debugAvailable = false) {
   const items = [`<span class="badge primary-badge">${escapeHtml(modeName(mode))}</span>`];
   if (confidence) items.push(`<span class="badge">${escapeHtml(confidence)} confidence</span>`);
   if (latency != null) items.push(`<span class="badge">${formatDuration(latency)}</span>`);
   const date = createdAt ? `<span class="subtle">${new Date(createdAt).toLocaleString()}</span>` : '';
-  return `<div class="answer-toolbar"><div class="badges">${items.join('')}</div><div class="answer-actions">${date}<button class="copy-answer secondary" type="button" title="Copy answer" aria-label="Copy answer">Copy</button></div></div>`;
+  const debug = queryId && debugAvailable ? `<a class="secondary debug-download" href="/api/v1/query/${encodeURIComponent(queryId)}/debug" download title="Download AI interpretation, search probes, candidate results, audit and recovery trace">Debug</a>` : '';
+  return `<div class="answer-toolbar"><div class="badges">${items.join('')}</div><div class="answer-actions">${date}${debug}<button class="copy-answer secondary" type="button" title="Copy answer" aria-label="Copy answer">Copy</button></div></div>`;
 }
 
 function renderFinalAnswer(article, result, createdAt = null, keepProgress = true) {
@@ -331,7 +332,7 @@ function renderFinalAnswer(article, result, createdAt = null, keepProgress = tru
   const workflowDetails = workflow ? `<details class="workflow-details"><summary>Processing</summary>${workflow}</details>` : '';
   const citations = result.citations?.length ? result.citations.map(citationHtml).join('') : '<p class="warning">No source citations returned.</p>';
   answerTextByCard.set(article, result.answer || '');
-  area.innerHTML = `${answerToolbar(result.resolved_mode || result.mode, result.confidence, result.latency_ms, createdAt)}${workflowDetails}<div class="markdown-body">${renderMarkdown(result.answer)}</div>${visualEvidenceHtml(result.visuals)}<details class="source-details"><summary>Sources · ${result.citations?.length || 0}</summary><div class="sources">${citations}</div></details>${result.query_id ? `<div class="feedback-row"><span>Helpful?</span><button class="feedback-button" data-query-id="${escapeHtml(result.query_id)}" data-rating="5">Yes</button><button class="feedback-button" data-query-id="${escapeHtml(result.query_id)}" data-rating="2">Needs work</button></div>` : ''}`;
+  area.innerHTML = `${answerToolbar(result.resolved_mode || result.mode, result.confidence, result.latency_ms, createdAt, result.query_id, result.debug_download_available)}${workflowDetails}<div class="markdown-body">${renderMarkdown(result.answer)}</div>${visualEvidenceHtml(result.visuals)}<details class="source-details"><summary>Sources · ${result.citations?.length || 0}</summary><div class="sources">${citations}</div></details>${result.query_id ? `<div class="feedback-row"><span>Helpful?</span><button class="feedback-button" data-query-id="${escapeHtml(result.query_id)}" data-rating="5">Yes</button><button class="feedback-button" data-query-id="${escapeHtml(result.query_id)}" data-rating="2">Needs work</button></div>` : ''}`;
   bindCitationPreviews(article, result.citations || []);
   if (article.closest('#activeQuery')) scrollConversationToNode(area.querySelector('.answer-toolbar') || area);
 }

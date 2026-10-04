@@ -27,6 +27,7 @@ from ike.workflows.evidence_planning import (
     EvidencePlan,
     GoalAuditPayload,
     GoalSatisfaction,
+    GoalStatus,
     SemanticEvidencePlanPayload,
     build_deterministic_evidence_plan,
     evidence_plan_from_payload,
@@ -167,6 +168,79 @@ class QAGraphService:
                 lines.append(f"- {title}: {section}")
         return ("\n".join(lines) or "No corpus-index hints were available.")[:5000]
 
+    @staticmethod
+    def _apply_semantic_plan_to_query_plan(
+        query_plan: QueryPlan,
+        plan: EvidencePlan,
+        question: str,
+    ) -> QueryPlan:
+        """Project the LLM evidence contract into retrieval metadata.
+
+        This deliberately replaces deterministic intent/facet/query guesses. Literal line,
+        rolling-stock and other applicability metadata already extracted from the user's own
+        text may remain, but they no longer decide the semantic task.
+        """
+
+        semantic_queries: list[str] = [question]
+        lexical_queries: list[str] = []
+        exact_terms: list[str] = []
+        grounded_terms: list[str] = [
+            *plan.source_hints,
+            *plan.entities,
+        ]
+        for goal in plan.goals:
+            semantic_queries.extend(goal.search_queries)
+            lexical_queries.extend(goal.search_queries)
+            grounded_terms.extend(goal.entity_terms)
+
+        def unique(values: list[str], limit: int) -> list[str]:
+            result: list[str] = []
+            seen: set[str] = set()
+            for raw in values:
+                value = re.sub(r"\s+", " ", str(raw or "").strip())
+                key = value.casefold()
+                if not value or key in seen:
+                    continue
+                seen.add(key)
+                result.append(value)
+                if len(result) >= limit:
+                    break
+            return result
+
+        grounded_terms = unique(grounded_terms, 16)
+        query_plan.semantic_queries = unique(semantic_queries, 16)
+        query_plan.lexical_queries = unique([*grounded_terms, *lexical_queries], 16)
+        query_plan.exact_terms = grounded_terms[:12]
+        query_plan.entity_terms = list(plan.entities)
+        query_plan.entity_term = plan.entities[0] if len(plan.entities) == 1 else None
+        query_plan.content_terms = list(plan.entities)
+        query_plan.scope_terms = list(plan.source_hints)
+        query_plan.topic = plan.interpretation or (" / ".join(plan.entities) if plan.entities else question)
+        query_plan.source_scope = plan.source_hints[0] if len(plan.source_hints) == 1 else None
+        # Downstream retrieval can consume coarse labels chosen by the semantic planner,
+        # but these labels are consequences of model understanding, never regex authorities.
+        semantic_kinds = {goal.kind for goal in plan.goals}
+        query_plan.facets = [
+            value
+            for value in ("enumeration", "procedure", "comparison", "definition")
+            if value in semantic_kinds or plan.answer_shape == value
+        ]
+        query_plan.attribute_terms = []
+        query_plan.coverage_kind = None
+        query_plan.lookup_term = None
+        query_plan.role_subject = None
+        query_plan.answer_type = plan.answer_shape
+        query_plan.short_or_vague = False
+        if any(goal.kind == "procedure" for goal in plan.goals):
+            query_plan.intent = "procedure"
+        elif any(goal.kind == "definition" for goal in plan.goals):
+            query_plan.intent = "definition"
+        elif any(goal.kind == "comparison" for goal in plan.goals):
+            query_plan.intent = "comparison"
+        else:
+            query_plan.intent = "information"
+        return query_plan
+
     def _retrieval_confidence(self, evidence: list[Evidence], trace: dict) -> str:
         if (
             trace.get("definition_fast_path_satisfied")
@@ -286,23 +360,27 @@ class QAGraphService:
                     query_plan.semantic_queries.append(hypothesis)
                     existing_semantic.add(hypothesis.casefold())
 
-        evidence_plan = build_deterministic_evidence_plan(state["question"], query_plan)
+        fallback_evidence_plan = build_deterministic_evidence_plan(state["question"], query_plan)
+        evidence_plan = fallback_evidence_plan
         input_tokens = state.get("input_tokens", 0)
         output_tokens = state.get("output_tokens", 0)
         workflow_timings = dict(state.get("workflow_timings_ms", {}))
 
+        primary_semantic_planning = bool(
+            self.settings.compositional_planning_enabled
+            and self.settings.semantic_primary_planning_enabled
+        )
         standard_semantic_planning = bool(
             self.settings.compositional_semantic_planning_enabled
-            and should_use_semantic_planner(state["question"], query_plan, evidence_plan)
+            and should_use_semantic_planner(state["question"], query_plan, fallback_evidence_plan)
         )
         semantic_repair_planning = bool(
             self.settings.compositional_semantic_repair_enabled
-            and should_repair_with_semantic_planner(state["question"], query_plan, evidence_plan)
+            and should_repair_with_semantic_planner(state["question"], query_plan, fallback_evidence_plan)
         )
         semantic_planning_requested = bool(
-            state.get("experience") != "realtime"
-            and self.settings.compositional_planning_enabled
-            and (standard_semantic_planning or semantic_repair_planning)
+            self.settings.compositional_planning_enabled
+            and (primary_semantic_planning or standard_semantic_planning or semantic_repair_planning)
         )
         if semantic_planning_requested:
             semantic_started = time.perf_counter()
@@ -313,9 +391,12 @@ class QAGraphService:
                         self.settings.compositional_queries_per_goal,
                     ),
                     user=(
-                        semantic_planner_user_prompt(state["question"], evidence_plan)
+                        semantic_planner_user_prompt(
+                            state["question"],
+                            None if primary_semantic_planning else fallback_evidence_plan,
+                        )
                         + "\n\n"
-                        + corpus_discovery.prompt_block(max_hits=10)
+                        + corpus_discovery.prompt_block(max_hits=12)
                     ),
                     schema_model=SemanticEvidencePlanPayload,
                     strong=False,
@@ -324,21 +405,81 @@ class QAGraphService:
                 evidence_plan = evidence_plan_from_payload(
                     state["question"],
                     payload_model.model_dump(),
-                    evidence_plan,
+                    fallback_evidence_plan,
                     max_goals=self.settings.compositional_max_goals,
                     max_queries_per_goal=self.settings.compositional_queries_per_goal,
+                    preserve_fallback_semantics=not primary_semantic_planning,
                 )
+
+                # If the semantic planner chose a hierarchy/navigation tool but omitted
+                # source_hints, recover a named source only from its own user-grounded
+                # entities and the live document catalogue. This keeps interpretation
+                # AI-first while preventing a named rulebook/manual from degrading into a
+                # corpus-wide acronym search. No document name is encoded in application code.
+                if (
+                    evidence_plan.planner_source == "semantic"
+                    and primary_semantic_planning
+                    and not evidence_plan.source_hints
+                    and any(
+                        tool in {"document_structure", "section_navigation"}
+                        for goal in evidence_plan.goals
+                        for tool in goal.retrieval_tools
+                    )
+                ):
+                    original_tokens = {
+                        token.casefold()
+                        for token in re.findall(r"[A-Za-z0-9]+", state["question"])
+                    }
+                    for candidate_source in evidence_plan.entities:
+                        candidate_tokens = [
+                            token.casefold()
+                            for token in re.findall(r"[A-Za-z0-9]+", candidate_source)
+                        ]
+                        if not candidate_tokens or not all(
+                            token in original_tokens for token in candidate_tokens
+                        ):
+                            continue
+                        if self.retrieval.resolve_named_source_scope(
+                            candidate_source, self.user, max_documents=6
+                        ):
+                            evidence_plan.source_hints = [candidate_source]
+                            evidence_plan.warnings.append(
+                                "semantic_structural_source_resolved_from_user_entity"
+                            )
+                            break
+
                 input_tokens += result.input_tokens
                 output_tokens += result.output_tokens
-                if evidence_plan.planner_source != "semantic":
-                    # If a question was complex/indirect enough to require semantic planning,
-                    # an invalid planner response must fail safe rather than silently returning
-                    # to a high-confidence bounded Direct path.
+                if evidence_plan.planner_source == "semantic" and primary_semantic_planning:
+                    # The semantic plan is now the retrieval contract. Deterministic routing
+                    # remains fallback metadata only and is not allowed to redefine intent.
+                    query_plan = self._apply_semantic_plan_to_query_plan(
+                        query_plan,
+                        evidence_plan,
+                        state["question"],
+                    )
+
+                    query_frame = QueryFrame(
+                        original=state["question"],
+                        answer_shape=evidence_plan.answer_shape,
+                        entities=list(evidence_plan.entities),
+                        relations=[
+                            goal.relation for goal in evidence_plan.goals if goal.relation
+                        ],
+                        explicit_scope=list(evidence_plan.source_hints),
+                        canonical_terms=list(evidence_plan.entities),
+                        alternate_phrasings=query_plan.semantic_queries[1:12],
+                        requires_cross_document_reasoning=bool(
+                            evidence_plan.requires_decomposition or evidence_plan.needs_research
+                        ),
+                    )
+                elif evidence_plan.planner_source != "semantic":
                     evidence_plan.needs_research = True
                     evidence_plan.needs_verification = True
                     evidence_plan.warnings.append("semantic_planner_invalid_fallback_forced_research")
             except Exception:
                 logger.exception("evidence_planning_failed")
+                evidence_plan = fallback_evidence_plan
                 evidence_plan.needs_research = True
                 evidence_plan.needs_verification = True
                 evidence_plan.warnings.append("semantic_planner_failed_using_research_fallback")
@@ -536,14 +677,17 @@ class QAGraphService:
         hard_scope_ids = state.get("document_ids")
         named_source_scope_ids: list[UUID] = []
         query_plan = state.get("query_plan") or build_query_plan(state["question"])
-        if (
-            state.get("experience") != "realtime"
-            and not hard_scope_ids
-            and query_plan.source_scope
-        ):
-            named_source_scope_ids = self.retrieval.resolve_named_source_scope(
-                query_plan.source_scope, self.user
-            )
+        evidence_plan = state.get("evidence_plan")
+        semantic_source_hints = list(getattr(evidence_plan, "source_hints", []) or [])
+        source_hints = list(dict.fromkeys([
+            *semantic_source_hints,
+            *([query_plan.source_scope] if query_plan.source_scope else []),
+        ]))
+        if not hard_scope_ids and source_hints:
+            for source_hint in source_hints:
+                for document_id in self.retrieval.resolve_named_source_scope(source_hint, self.user):
+                    if document_id not in named_source_scope_ids:
+                        named_source_scope_ids.append(document_id)
             if named_source_scope_ids:
                 hard_scope_ids = named_source_scope_ids
 
@@ -586,6 +730,43 @@ class QAGraphService:
             progress=self.progress,
             progress_points=(18, 30, 42, 52),
         )
+
+        planned_structural_candidates = self.retrieval.retrieve_planned_structural_context(
+            state.get("evidence_plan"),
+            self.user,
+            hard_scope_ids,
+            max_candidates=min(24, self.settings.compositional_max_evidence_k),
+        )
+        if planned_structural_candidates:
+            structural_evidence = [
+                Evidence(evidence_id=f"S{i}", candidate=candidate)
+                for i, candidate in enumerate(planned_structural_candidates, 1)
+            ]
+            evidence = self._merge_evidence(
+                structural_evidence,
+                evidence,
+                limit=self.settings.compositional_max_evidence_k,
+                evidence_plan=state.get("evidence_plan"),
+            )
+            for index, item in enumerate(evidence, start=1):
+                item.evidence_id = f"E{index}"
+            if state.get("evidence_plan") is not None:
+                trace = self._merge_stage_trace(
+                    prior_trace={},
+                    stage_trace=trace,
+                    evidence_plan=state["evidence_plan"],
+                    evidence=evidence,
+                )
+            trace["planned_structural_context_count"] = len(planned_structural_candidates)
+            trace["planned_structural_tools"] = sorted({
+                tool
+                for goal in state["evidence_plan"].goals
+                for tool in goal.retrieval_tools
+                if tool in {"document_structure", "section_navigation"}
+            })
+        else:
+            trace["planned_structural_context_count"] = 0
+
         okf_targeted_trace: dict = {}
         okf_id_set = set(okf_ids)
         okf_hit_items = [
@@ -756,6 +937,7 @@ class QAGraphService:
         trace["hard_scope_document_ids"] = [str(item) for item in (hard_scope_ids or [])]
         trace["routed_document_ids"] = [str(item) for item in (boost_ids or [])]
         trace["routing_is_hard_scope"] = bool(hard_scope_ids)
+        trace["semantic_source_hints"] = semantic_source_hints
         trace["named_source_scope"] = query_plan.source_scope
         trace["named_source_scope_document_ids"] = [str(item) for item in named_source_scope_ids]
         trace["named_source_scope_resolved"] = bool(named_source_scope_ids)
@@ -833,16 +1015,18 @@ class QAGraphService:
         entity_coverage = "entity_attribute" in (plan.coverage_kind or "")
         coverage_sensitive = plan.coverage_sensitive
         evidence_plan = state.get("evidence_plan")
-        if evidence_plan is not None and evidence_plan.requires_decomposition:
+        if evidence_plan is not None and (
+            evidence_plan.planner_source == "semantic" or evidence_plan.requires_decomposition
+        ):
             self._emit(
                 "expand",
                 "Mapping independent evidence searches",
-                f"Using {len(evidence_plan.goals)} atomic evidence goals instead of paraphrasing the whole question into another single search string.",
+                f"Using {len(evidence_plan.goals)} planned evidence goal(s) and their semantic search hypotheses instead of adding another paraphrase layer.",
                 18 if state["requested_mode"] == "research" else 56,
             )
             return {
                 "expansions": [],
-                "workflow_timings_ms": self._timing_update(state, "query_expansion_skipped_compositional", started),
+                "workflow_timings_ms": self._timing_update(state, "query_expansion_skipped_semantic_plan", started),
             }
         if role_coverage:
             detail = "Using deterministic role alias resolution and section-level corpus coverage before synthesis."
@@ -911,10 +1095,17 @@ class QAGraphService:
         hard_scope_ids = state.get("document_ids")
         named_source_scope_ids: list[UUID] = []
         query_plan = state.get("query_plan") or build_query_plan(state["question"])
-        if not hard_scope_ids and query_plan.source_scope:
-            named_source_scope_ids = self.retrieval.resolve_named_source_scope(
-                query_plan.source_scope, self.user
-            )
+        expanded_plan = state.get("evidence_plan")
+        semantic_source_hints = list(getattr(expanded_plan, "source_hints", []) or [])
+        source_hints = list(dict.fromkeys([
+            *semantic_source_hints,
+            *([query_plan.source_scope] if query_plan.source_scope else []),
+        ]))
+        if not hard_scope_ids and source_hints:
+            for source_hint in source_hints:
+                for document_id in self.retrieval.resolve_named_source_scope(source_hint, self.user):
+                    if document_id not in named_source_scope_ids:
+                        named_source_scope_ids.append(document_id)
             if named_source_scope_ids:
                 hard_scope_ids = named_source_scope_ids
         boost_ids = None if hard_scope_ids else combined_routed_ids[: self.settings.retrieval_intelligence_documents_max_focused]
@@ -944,6 +1135,43 @@ class QAGraphService:
             progress=self.progress,
             progress_points=((60, 66, 72, 76) if state["requested_mode"] == "auto" else (32, 44, 56, 66)),
         )
+
+        planned_structural_candidates = self.retrieval.retrieve_planned_structural_context(
+            expanded_plan,
+            self.user,
+            hard_scope_ids,
+            max_candidates=min(24, self.settings.compositional_max_evidence_k),
+        )
+        if planned_structural_candidates:
+            structural_evidence = [
+                Evidence(evidence_id=f"S{i}", candidate=candidate)
+                for i, candidate in enumerate(planned_structural_candidates, 1)
+            ]
+            evidence = self._merge_evidence(
+                structural_evidence,
+                evidence,
+                limit=self.settings.compositional_max_evidence_k,
+                evidence_plan=expanded_plan,
+            )
+            for index, item in enumerate(evidence, start=1):
+                item.evidence_id = f"E{index}"
+            if expanded_plan is not None:
+                trace = self._merge_stage_trace(
+                    prior_trace={},
+                    stage_trace=trace,
+                    evidence_plan=expanded_plan,
+                    evidence=evidence,
+                )
+            trace["planned_structural_context_count"] = len(planned_structural_candidates)
+            trace["planned_structural_tools"] = sorted({
+                tool
+                for goal in expanded_plan.goals
+                for tool in goal.retrieval_tools
+                if tool in {"document_structure", "section_navigation"}
+            })
+        else:
+            trace["planned_structural_context_count"] = 0
+
         okf_id_set = set(okf_ids)
         prior_okf = [
             item for item in (state.get("evidence") or [])
@@ -1112,6 +1340,7 @@ class QAGraphService:
         trace["hard_scope_document_ids"] = [str(item) for item in (hard_scope_ids or [])]
         trace["routed_document_ids"] = [str(item) for item in (boost_ids or [])]
         trace["routing_is_hard_scope"] = bool(hard_scope_ids)
+        trace["semantic_source_hints"] = semantic_source_hints
         trace["named_source_scope"] = query_plan.source_scope
         trace["named_source_scope_document_ids"] = [str(item) for item in named_source_scope_ids]
         trace["named_source_scope_resolved"] = bool(named_source_scope_ids)
@@ -1347,14 +1576,136 @@ class QAGraphService:
                 "workflow_timings_ms": self._timing_update(state, "goal_recovery_skipped", started),
             }
 
-        unresolved = list(dict.fromkeys([*satisfaction.missing_goal_ids, *satisfaction.partial_goal_ids]))
         quality_issues = list((state.get("retrieval_trace") or {}).get("retrieval_quality_issues") or [])
+        input_tokens = state.get("input_tokens", 0)
+        output_tokens = state.get("output_tokens", 0)
+        semantic_replan_attempted = False
+        semantic_replan_changed = False
+        semantic_replan_previous_plan: dict | None = None
+        semantic_replan_query_frame: QueryFrame | None = None
+
+        if (
+            self.settings.adaptive_semantic_replanning_enabled
+            and evidence_plan.planner_source == "semantic"
+        ):
+            # Query repair is not enough when the evidence contract itself misunderstood
+            # the user. Review the whole semantic contract once, using the audit and corpus
+            # hints, before choosing the recovery search. This is bounded by the existing
+            # single recovery loop; it cannot recurse indefinitely.
+            semantic_replan_attempted = True
+            compact_replan_evidence = "\n\n---\n\n".join(
+                item.prompt_block()[:1800] for item in state.get("evidence", [])[:12]
+            )
+            replan_system = (
+                semantic_planner_system_prompt(
+                    self.settings.compositional_max_goals,
+                    self.settings.compositional_queries_per_goal,
+                )
+                + " You are reviewing a previous semantic plan after retrieval failed its "
+                "evidence audit. Do not merely rewrite search strings. Decide whether the "
+                "plan itself misunderstood the user's request, source relationship, answer "
+                "shape, requested structure, or evidence requirements. If so, return a "
+                "corrected complete plan. If the plan is already semantically correct, "
+                "reproduce its meaning and only improve search hypotheses where useful."
+            )
+            replan_user = (
+                f"User question:\n{state['question']}\n\n"
+                f"CURRENT SEMANTIC PLAN:\n{evidence_plan.prompt_block()}\n\n"
+                f"EVIDENCE AUDIT:\n{satisfaction.prompt_block()}\n\n"
+                "CORPUS-INDEX HINTS (navigation/search hints, not answer evidence):\n"
+                + self._corpus_repair_hints(state.get("corpus_discovery"))
+                + "\n\nCURRENT RETRIEVED EVIDENCE:\n"
+                + compact_replan_evidence
+                + "\n\nReturn the complete replacement semantic plan using the required schema."
+            )
+            try:
+                payload_model, result = self.llm.generate_structured(
+                    system=replan_system,
+                    user=replan_user,
+                    schema_model=SemanticEvidencePlanPayload,
+                    strong=False,
+                    max_output_tokens=self.settings.compositional_planner_max_output_tokens,
+                )
+                input_tokens += result.input_tokens
+                output_tokens += result.output_tokens
+                replanned = evidence_plan_from_payload(
+                    state["question"],
+                    payload_model.model_dump(),
+                    evidence_plan,
+                    max_goals=self.settings.compositional_max_goals,
+                    max_queries_per_goal=self.settings.compositional_queries_per_goal,
+                    preserve_fallback_semantics=False,
+                )
+
+                def _plan_signature(plan: EvidencePlan) -> tuple:
+                    return (
+                        plan.answer_shape,
+                        tuple(value.casefold() for value in plan.source_hints),
+                        plan.strategy,
+                        tuple(
+                            (
+                                goal.kind,
+                                goal.question.casefold(),
+                                tuple(value.casefold() for value in goal.entity_terms),
+                                goal.coverage_contract,
+                                tuple(goal.retrieval_tools),
+                                (goal.relation or "").casefold(),
+                            )
+                            for goal in plan.required_goals
+                        ),
+                    )
+
+                if replanned.planner_source == "semantic" and _plan_signature(replanned) != _plan_signature(evidence_plan):
+                    semantic_replan_previous_plan = evidence_plan.as_dict()
+                    evidence_plan = replanned
+                    semantic_replan_changed = True
+                    satisfaction = GoalSatisfaction(
+                        complete=False,
+                        statuses=[
+                            GoalStatus(
+                                goal_id=goal.id,
+                                status="missing",
+                                reason="Semantic replan changed the evidence contract; retrieve evidence for the revised goal.",
+                            )
+                            for goal in evidence_plan.required_goals
+                        ],
+                        missing_goal_ids=[goal.id for goal in evidence_plan.required_goals],
+                        partial_goal_ids=[],
+                        contradicted_goal_ids=[],
+                        audit_source="semantic_replan",
+                    )
+
+                    query_plan = self._apply_semantic_plan_to_query_plan(
+                        state.get("query_plan") or build_query_plan(state["question"]),
+                        evidence_plan,
+                        state["question"],
+                    )
+                    semantic_replan_query_frame = QueryFrame(
+                        original=state["question"],
+                        answer_shape=evidence_plan.answer_shape,
+                        entities=list(evidence_plan.entities),
+                        relations=[goal.relation for goal in evidence_plan.goals if goal.relation],
+                        explicit_scope=list(evidence_plan.source_hints),
+                        canonical_terms=list(evidence_plan.entities),
+                        alternate_phrasings=query_plan.semantic_queries[1:12],
+                        requires_cross_document_reasoning=bool(
+                            evidence_plan.requires_decomposition or evidence_plan.needs_research
+                        ),
+                    )
+            except Exception:
+                logger.exception("adaptive_semantic_replanning_failed")
+
+        unresolved = list(dict.fromkeys([*satisfaction.missing_goal_ids, *satisfaction.partial_goal_ids]))
         if not unresolved and quality_issues:
             unresolved = [goal.id for goal in evidence_plan.required_goals]
         unresolved = unresolved[: self.settings.compositional_recovery_max_goals]
         if not unresolved:
             return {
+                "evidence_plan": evidence_plan,
+                "query_frame": semantic_replan_query_frame or state.get("query_frame"),
                 "recovery_attempted": True,
+                "input_tokens": input_tokens,
+                "output_tokens": output_tokens,
                 "workflow_timings_ms": self._timing_update(state, "goal_recovery_skipped", started),
             }
 
@@ -1414,7 +1765,15 @@ class QAGraphService:
         )
 
         semantic_recovery_attempted = False
-        if (
+        if semantic_replan_changed:
+            # A changed semantic contract already contains fresh search hypotheses. Avoid a
+            # second LLM rewrite in the same bounded recovery cycle.
+            expansions = {
+                goal.id: list(goal.search_queries)[: self.settings.recovery_max_queries_per_goal]
+                for goal in evidence_plan.required_goals
+                if goal.id in set(unresolved) and goal.search_queries
+            }
+        elif (
             state.get("experience") != "realtime"
             and self.settings.adaptive_semantic_recovery_enabled
         ):
@@ -1437,8 +1796,8 @@ class QAGraphService:
                     strong=False,
                     max_output_tokens=self.settings.retrieval_repair_max_output_tokens,
                 )
-                state["input_tokens"] = state.get("input_tokens", 0) + result.input_tokens
-                state["output_tokens"] = state.get("output_tokens", 0) + result.output_tokens
+                input_tokens += result.input_tokens
+                output_tokens += result.output_tokens
                 expansions = repair_queries_from_payload(
                     payload,
                     question=state["question"],
@@ -1483,6 +1842,14 @@ class QAGraphService:
         recovery_scope_ids = (
             recovery_boost_ids if realtime_recovery and recovery_boost_ids else state.get("document_ids")
         )
+        if not state.get("document_ids") and evidence_plan.source_hints:
+            semantic_scope_ids: list[UUID] = []
+            for source_hint in evidence_plan.source_hints:
+                for document_id in self.retrieval.resolve_named_source_scope(source_hint, self.user):
+                    if document_id not in semantic_scope_ids:
+                        semantic_scope_ids.append(document_id)
+            if semantic_scope_ids:
+                recovery_scope_ids = semantic_scope_ids
 
         # Enumeration/overview failures inside large handbooks need section diversity, not
         # merely another document-diverse top-k. Re-run the cheap corpus-section router on
@@ -1491,10 +1858,7 @@ class QAGraphService:
         recovery_discovery = state.get("corpus_discovery") or {}
         enumeration_rediscovery_queries: list[str] = []
         enumeration_rediscovery_hit_count = 0
-        if (
-            not realtime_recovery
-            and self.settings.adaptive_enumeration_section_rediscovery_enabled
-        ):
+        if self.settings.adaptive_enumeration_section_rediscovery_enabled:
             enum_goal_ids = {
                 goal.id
                 for goal in evidence_plan.goals
@@ -1508,7 +1872,7 @@ class QAGraphService:
             )
 
             if enumeration_rediscovery_queries:
-                hint_scope_ids = state.get("document_ids") or state.get("okf_document_ids") or None
+                hint_scope_ids = recovery_scope_ids or state.get("okf_document_ids") or None
                 rediscovered_hits: list[dict] = []
                 for query in enumeration_rediscovery_queries:
                     try:
@@ -1634,14 +1998,48 @@ class QAGraphService:
             progress_points=(75, 78, 81, 83),
         )
 
-        recovered_with_section = [*partial_section_evidence, *corpus_section_evidence, *recovered]
-        if state.get("experience") == "realtime":
-            # Recovery ran because the scoped first pass was weak. Let broadened evidence
-            # lead the merge instead of allowing the known-bad first pass to dominate.
+        planned_recovery_candidates = self.retrieval.retrieve_planned_structural_context(
+            evidence_plan,
+            self.user,
+            recovery_scope_ids,
+            max_candidates=min(24, self.settings.compositional_max_evidence_k),
+        )
+        planned_recovery_evidence = [
+            Evidence(evidence_id=f"P{i}", candidate=candidate)
+            for i, candidate in enumerate(planned_recovery_candidates, 1)
+        ]
+
+        recovered_with_section = [
+            *planned_recovery_evidence,
+            *partial_section_evidence,
+            *corpus_section_evidence,
+            *recovered,
+        ]
+        if state.get("experience") == "realtime" or semantic_replan_changed:
+            # Recovery ran because the scoped first pass was weak. When the semantic plan
+            # itself changed, let evidence for the revised contract lead the merge instead
+            # of allowing evidence gathered for the old meaning to dominate. Structural and
+            # set/list plans need enough slots to preserve every discovered member; a fixed
+            # 12-item cap can itself make a correct hierarchy look incomplete.
+            recovery_merge_limit = min(12, self.settings.compositional_max_evidence_k)
+            if semantic_replan_changed and any(
+                "document_structure" in goal.retrieval_tools
+                or goal.coverage_contract in {
+                    "enumerate_set", "ordered_procedure", "all_requested_entities", "compare_variants"
+                }
+                for goal in evidence_plan.required_goals
+            ):
+                recovery_merge_limit = min(
+                    self.settings.compositional_max_evidence_k,
+                    max(
+                        self.settings.enumeration_recovery_evidence_k,
+                        len(planned_recovery_evidence),
+                    ),
+                )
             merged = self._merge_evidence(
                 recovered_with_section,
                 state.get("evidence", []),
-                limit=min(12, self.settings.compositional_max_evidence_k),
+                limit=recovery_merge_limit,
                 evidence_plan=evidence_plan,
                 satisfaction=satisfaction,
             )
@@ -1670,6 +2068,11 @@ class QAGraphService:
         trace["recovery_boost_document_ids"] = [str(item) for item in recovery_boost_ids]
         trace["recovery_summary"] = {
             "queries": recovery_trace.get("queries", []),
+            "query_specs": recovery_trace.get("query_specs", []),
+            "query_result_previews": recovery_trace.get("query_result_previews", []),
+            "fused_candidate_preview": recovery_trace.get("fused_candidate_preview", []),
+            "reranked_candidate_preview": recovery_trace.get("reranked_candidate_preview", []),
+            "evidence": recovery_trace.get("evidence", []),
             "source_counts": recovery_trace.get("source_counts", {}),
             "fused_candidates": recovery_trace.get("fused_candidates", 0),
             "reranked_candidates": recovery_trace.get("reranked_candidates", 0),
@@ -1677,6 +2080,12 @@ class QAGraphService:
             "goal_stats": recovery_trace.get("goal_stats", {}),
             "semantic_recovery_attempted": semantic_recovery_attempted,
             "semantic_recovery_query_count": sum(len(items) for items in expansions.values()),
+            "semantic_replan_attempted": semantic_replan_attempted,
+            "semantic_replan_changed": semantic_replan_changed,
+            "semantic_replan_previous_plan": semantic_replan_previous_plan,
+            "replanned_evidence_plan": evidence_plan.as_dict() if semantic_replan_changed else None,
+            "planned_structural_candidate_count": len(planned_recovery_evidence),
+            "recovery_scope_document_ids": [str(item) for item in (recovery_scope_ids or [])],
             "recovery_profile": recovery_profile,
             "adaptive_cross_encoder_used": recovery_profile == "research",
             "diagnoses": [item.as_dict() for item in diagnoses],
@@ -1711,11 +2120,14 @@ class QAGraphService:
         ]
         return {
             "evidence": merged,
+            "evidence_plan": evidence_plan,
+            "query_plan": state.get("query_plan"),
+            "query_frame": semantic_replan_query_frame or state.get("query_frame"),
             "retrieval_trace": trace,
             "confidence": self._retrieval_confidence(merged, trace),
             "recovery_attempted": True,
-            "input_tokens": state.get("input_tokens", 0),
-            "output_tokens": state.get("output_tokens", 0),
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
             "workflow_timings_ms": self._timing_update(state, "goal_recovery", started),
         }
 
@@ -1834,8 +2246,8 @@ class QAGraphService:
         if not evidence:
             return {
                 "answer": (
-                    "I could not find accessible, active document evidence that answers this question. "
-                    "Try a related term, acronym, document scope, or a broader description of what you are looking for."
+                    "I do not have enough verified source material to give a reliable answer to this request yet. "
+                    "Rather than guess, IMS has kept the response conservative. A broader description or selecting the likely source PDF can help the next pass."
                 ),
                 "cited_ids": [],
                 "confidence": "low",
@@ -1911,7 +2323,7 @@ class QAGraphService:
                 "For calculations, use only evidenced inputs, identify the formula/assumptions, and do not manufacture a missing value. For current/revision questions, do not infer precedence without effective-date/revision/authority evidence. "
                 "Treat document titles and section paths as navigation metadata, not standalone proof of applicability. If an inherited/ancestor heading appears narrower or inconsistent with the passage text, do not impose that scope unless the cited passage itself establishes it. "
                 + (
-                    f"The following required goals remain unresolved after targeted retrieval: {', '.join(unresolved)}. State those limitations precisely while still answering supported goals. "
+                    f"The following required goals remain unresolved after targeted retrieval: {', '.join(unresolved)}. Answer supported parts first, then describe only the remaining point as 'not yet verified from the available evidence'. Avoid phrases such as 'could not retrieve', 'not present in the documents', or 'the documents do not contain' unless the user explicitly asks for retrieval diagnostics or a proven exhaustive absence. "
                     if unresolved else
                     "The goal audit found evidence for all required goals; still keep each conclusion attached to the evidence that actually supports it. "
                 )
@@ -1948,13 +2360,13 @@ class QAGraphService:
         retrieval_quality_instruction = (
             "The retrieval quality gate still reports unresolved issues after the bounded recovery pass: "
             + ", ".join(quality_issues)
-            + ". Do not present a definitive absence, universal rule, or scope-specific operational instruction unless the supplied evidence itself resolves those issues. State the limitation precisely. "
+            + ". Do not present a definitive absence, universal rule, or scope-specific operational instruction unless the supplied evidence resolves those issues. Lead with what is established; if something remains open, say only that it is not yet verified from the available evidence. Do not expose retrieval-system failure wording to ordinary users. "
             if quality_issues and state.get("recovery_attempted", False) else ""
         )
 
         corpus_claim_instruction = (
             "Corpus-wide absence claims require completed deterministic coverage. If coverage is not both requested and complete, never say that 'the documents', 'the corpus', or an entire source set does not contain/provide a fact. "
-            "Instead scope the statement precisely to the retrieved evidence, e.g. 'The retrieved evidence does not show ...'. "
+            "Lead with the positive facts the current evidence establishes. If a requested point remains unresolved, say it is 'not yet verified from the available evidence' rather than saying retrieval failed or the documents do not contain it. "
             + (
                 "The user explicitly requested a negative document inventory (documents that do NOT mention/contain something). Ordinary top-k retrieval cannot prove non-mention. Unless the supplied trace/evidence explicitly contains a completed exhaustive corpus-inventory operation, state that the negative inventory cannot be established reliably and do not fabricate a list of absent documents. "
                 if corpus_negative_inventory else ""
@@ -1966,7 +2378,7 @@ class QAGraphService:
         if "enumeration" in (query_plan.facets or []):
             helpful_instruction = (
                 "For a list/enumeration request, answer the requested list first and keep related context tightly bounded. "
-                "When the evidence includes an index, table of contents, directory, or category headings that identify additional requested items but does not include their operative values, enumerate those items in a clearly labeled 'identified but value/details not established in the retrieved evidence' group instead of silently omitting them. "
+                "When the evidence includes an index, table of contents, directory, or category headings that identify additional requested items but does not yet verify their operative values, enumerate those items in a clearly labeled 'identified items - details pending verification' group instead of silently omitting them. "
                 "Distinguish materially different documented scopes (for example allowance, reimbursement, subsidy, benefit, procedure, or travel entitlement) rather than flattening them into one homogeneous category. "
                 "Never invent a rate, condition, or applicability rule for an index-only item. "
                 "Do not add operating hours, permissions, procedures, matrices, or incidental mentions merely because they contain the same nouns; include such material only when it directly identifies, qualifies, or disambiguates an item in the requested list. "
@@ -2018,7 +2430,7 @@ class QAGraphService:
             "Evidence marked lane=overview is explanatory/background context only. Evidence marked lane=operational may support procedures/instructions. Never promote overview-only text into an approved operational instruction. "
             "Every factual claim must cite one or more evidence IDs exactly like [E1]. Preserve exact numbers, units, conditions, exceptions, sequence and modality words such as shall/must/may. "
             "Answer in the user's language when practical while preserving official document terminology, identifiers and quoted labels accurately. "
-            "If sources appear to conflict, first test whether their trigger, timing, operating state, location, or applicability actually overlap. Present scope-distinct instructions as separate conditional branches; only describe a true conflict when the same conditions overlap, and use revision/authority metadata only when it genuinely supports preference. If evidence is incomplete, say so precisely rather than inventing completion. "
+            "If sources appear to conflict, first test whether their trigger, timing, operating state, location, or applicability actually overlap. Present scope-distinct instructions as separate conditional branches; only describe a true conflict when the same conditions overlap, and use revision/authority metadata only when it genuinely supports preference. If evidence is incomplete, lead with what is supported and keep any unresolved note brief. Do not use internal-search wording such as 'I could not retrieve', 'the documents do not contain', 'not present in supplied extracts', or similar unless the user explicitly asks for diagnostics or the system has completed a valid exhaustive absence check. "
             "For procedures, prioritize immediate applicability, prerequisites/authority, ordered actions, completion/restoration, and material exceptions. "
             "Use Markdown tables only when structured comparison is clearer than prose; do not force procedures into tables. "
             "When a table-derived evidence item is terse, use its supplied table title/header/column context to interpret the row. "
