@@ -159,15 +159,10 @@ class CorpusMCPServer:
     """
 
     TOOL_NAMES = {
+        "search",
         "search_documents",
-        "search_chunks",
-        "search_many",
-        "search_lists",
-        "search_sections",
         "get_document_structure",
         "get_section",
-        "search_tables",
-        "exact_lookup",
     }
 
     def __init__(
@@ -189,49 +184,47 @@ class CorpusMCPServer:
     def tool_catalog(cls) -> list[dict]:
         return [
             {
+                "name": "search",
+                "description": (
+                    "Generic corpus evidence search. Supply a semantic research question plus "
+                    "literal anchors whose exact identity must be preserved. The backend searches "
+                    "the semantic request and each anchor independently and returns grouped results."
+                ),
+                "arguments": {
+                    "semantic_query": "string",
+                    "anchors": ["literal string"],
+                    "document_ids": ["uuid"],
+                },
+            },
+            {
                 "name": "search_documents",
-                "description": "Find likely source documents by title, filename and corpus index. Use for a named or suspected source.",
+                "description": (
+                    "Resolve a clearly named or referenced source document by title, filename "
+                    "and corpus index. Document matches are routing hints, not answer evidence."
+                ),
                 "arguments": {"query": "string"},
             },
             {
-                "name": "search_chunks",
-                "description": "Hybrid semantic+lexical chunk search. Default tool for one factual or procedural need.",
-                "arguments": {"query": "string", "document_ids": ["uuid"]},
-            },
-            {
-                "name": "search_many",
-                "description": "Run independent hybrid searches for multiple distinct requested parts. Provide one semantic query per part; results remain grouped so one category cannot crowd out another.",
-                "arguments": {"queries": ["string"], "document_ids": ["uuid"]},
-            },
-            {
-                "name": "search_lists",
-                "description": "Find set-bearing list, directory or table evidence for one or more requested categories. Provide one semantic subject per requested set. Use for list/all/names/locations enumeration requests rather than ordinary mention search.",
-                "arguments": {"subjects": ["string"], "document_ids": ["uuid"]},
-            },
-            {
-                "name": "search_sections",
-                "description": "Find section, chapter or topic anchors in the document hierarchy.",
-                "arguments": {"query": "string", "document_ids": ["uuid"]},
-            },
-            {
                 "name": "get_document_structure",
-                "description": "Return top-level headings for one document with representative evidence chunks.",
-                "arguments": {"document_id": "uuid", "query": "optional structural selector"},
+                "description": (
+                    "Inspect the indexed hierarchy/headings of one resolved document. An optional "
+                    "query can focus the returned structure without changing the source."
+                ),
+                "arguments": {
+                    "document_id": "uuid",
+                    "query": "optional structural selector",
+                },
             },
             {
                 "name": "get_section",
-                "description": "Fetch chunks belonging to the best matching named section in one document.",
-                "arguments": {"document_id": "uuid", "section_selector": "string"},
-            },
-            {
-                "name": "search_tables",
-                "description": "Search table chunks when the answer is likely in structured rows or columns.",
-                "arguments": {"query": "string", "document_ids": ["uuid"]},
-            },
-            {
-                "name": "exact_lookup",
-                "description": "Exact lookup for identifiers, quotations, rule numbers, codes or precise phrases.",
-                "arguments": {"query": "string", "document_ids": ["uuid"]},
+                "description": (
+                    "Fetch the bounded original chunks for the best matching named section/chapter "
+                    "inside one resolved document."
+                ),
+                "arguments": {
+                    "document_id": "uuid",
+                    "section_selector": "string",
+                },
             },
         ]
 
@@ -557,6 +550,127 @@ class CorpusMCPServer:
     ) -> ToolExecution:
         return self._hybrid_search(
             query, document_ids=document_ids, top_k=top_k
+        )
+
+
+    def search(
+        self,
+        semantic_query: str,
+        *,
+        anchors: list[str] | None = None,
+        document_ids: list[str] | None = None,
+        top_k: int | None = None,
+    ) -> ToolExecution:
+        """Search a research need while preserving model-selected literal anchors.
+
+        The agent decides what needs investigation and which literal strings matter. This
+        backend does not infer query type. It executes the semantic request and every anchor
+        independently, then returns grouped observations so an anchor cannot disappear inside
+        a paraphrase or be crowded out by another concept.
+        """
+        started = time.perf_counter()
+        semantic_query = " ".join(str(semantic_query or "").split())
+        cleaned_anchors: list[str] = []
+        seen: set[str] = set()
+        semantic_key = semantic_query.casefold()
+        for raw in anchors or []:
+            anchor = " ".join(str(raw or "").split())
+            key = anchor.casefold()
+            if not anchor or key in seen or key == semantic_key:
+                continue
+            seen.add(key)
+            cleaned_anchors.append(anchor)
+            if len(cleaned_anchors) >= 8:
+                break
+
+        if not semantic_query and not cleaned_anchors:
+            return ToolExecution(
+                tool="search",
+                arguments={
+                    "semantic_query": "",
+                    "anchors": [],
+                    "document_ids": list(document_ids or []),
+                },
+                note="No semantic query or literal anchors supplied.",
+            )
+
+        per_group_top_k = min(
+            max(1, top_k or min(6, self.settings.agent_search_top_k)),
+            self.settings.agent_search_top_k,
+        )
+        requests: list[tuple[str, str]] = []
+        if semantic_query:
+            requests.append(("semantic", semantic_query))
+        requests.extend(("anchor", anchor) for anchor in cleaned_anchors)
+
+        groups: list[dict] = []
+        group_candidates: list[list[Candidate]] = []
+        items: list[dict] = []
+
+        for kind, query in requests:
+            execution = self._hybrid_search(
+                query,
+                document_ids=document_ids,
+                top_k=per_group_top_k,
+            )
+            group_items: list[dict] = []
+            for item in execution.items:
+                enriched = dict(item)
+                enriched["query"] = query
+                enriched["kind"] = kind
+                if kind == "anchor":
+                    enriched["anchor"] = query
+                group_items.append(enriched)
+                items.append(enriched)
+            groups.append(
+                {
+                    "kind": kind,
+                    "query": query,
+                    "anchor": query if kind == "anchor" else None,
+                    "elapsed_ms": execution.elapsed_ms,
+                    "items": group_items,
+                }
+            )
+            tagged: list[Candidate] = []
+            for candidate in execution.candidates:
+                candidate.sources.add(
+                    "agent:generic_search:anchor"
+                    if kind == "anchor"
+                    else "agent:generic_search:semantic"
+                )
+                tagged.append(candidate)
+            group_candidates.append(tagged)
+
+        # Round-robin admission preserves evidence from every model-selected anchor.
+        candidates: list[Candidate] = []
+        seen_chunks: set[UUID] = set()
+        max_depth = max((len(group) for group in group_candidates), default=0)
+        for rank in range(max_depth):
+            for group in group_candidates:
+                if rank >= len(group):
+                    continue
+                candidate = group[rank]
+                if candidate.chunk_id in seen_chunks:
+                    continue
+                seen_chunks.add(candidate.chunk_id)
+                candidates.append(candidate)
+
+        return ToolExecution(
+            tool="search",
+            arguments={
+                "semantic_query": semantic_query,
+                "anchors": cleaned_anchors,
+                "document_ids": list(document_ids or []),
+                "top_k_per_probe": per_group_top_k,
+            },
+            items=items,
+            candidates=candidates,
+            query_groups=groups,
+            elapsed_ms=int((time.perf_counter() - started) * 1000),
+            note=(
+                "Generic semantic-plus-anchor retrieval. Literal anchors are searched "
+                "independently and are never replaced by paraphrases."
+            ),
         )
 
 
@@ -1382,48 +1496,26 @@ class CorpusMCPServer:
     def execute(self, tool: str, arguments: dict) -> ToolExecution:
         if tool not in self.TOOL_NAMES:
             return ToolExecution(
-                tool=tool, arguments=arguments, note="Unknown tool."
+                tool=tool, arguments=arguments, note="Unknown or non-agent-facing tool."
+            )
+        if tool == "search":
+            return self.search(
+                str(arguments.get("semantic_query") or ""),
+                anchors=[
+                    str(value) for value in (arguments.get("anchors") or [])
+                ],
+                document_ids=arguments.get("document_ids") or [],
             )
         if tool == "search_documents":
             return self.search_documents(
                 str(arguments.get("query") or "")
-            )
-        if tool == "search_chunks":
-            return self.search_chunks(
-                str(arguments.get("query") or ""),
-                document_ids=arguments.get("document_ids") or [],
-            )
-        if tool == "search_many":
-            return self.search_many(
-                [str(value) for value in (arguments.get("queries") or [])],
-                document_ids=arguments.get("document_ids") or [],
-            )
-        if tool == "search_lists":
-            return self.search_lists(
-                [str(value) for value in (arguments.get("subjects") or [])],
-                document_ids=arguments.get("document_ids") or [],
-            )
-        if tool == "search_sections":
-            return self.search_sections(
-                str(arguments.get("query") or ""),
-                document_ids=arguments.get("document_ids") or [],
             )
         if tool == "get_document_structure":
             return self.get_document_structure(
                 str(arguments.get("document_id") or ""),
                 str(arguments.get("query") or ""),
             )
-        if tool == "get_section":
-            return self.get_section(
-                str(arguments.get("document_id") or ""),
-                str(arguments.get("section_selector") or ""),
-            )
-        if tool == "search_tables":
-            return self.search_tables(
-                str(arguments.get("query") or ""),
-                document_ids=arguments.get("document_ids") or [],
-            )
-        return self.exact_lookup(
-            str(arguments.get("query") or ""),
-            document_ids=arguments.get("document_ids") or [],
+        return self.get_section(
+            str(arguments.get("document_id") or ""),
+            str(arguments.get("section_selector") or ""),
         )

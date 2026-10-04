@@ -26,21 +26,15 @@ CancelCheckFn = Callable[[], None]
 
 class AgentDecision(BaseModel):
     action: Literal[
+        "search",
         "search_documents",
-        "search_chunks",
-        "search_many",
-        "search_lists",
-        "search_sections",
         "get_document_structure",
         "get_section",
-        "search_tables",
-        "exact_lookup",
         "finish",
     ]
     decision_summary: str = Field(default="", max_length=500)
-    query: str = Field(default="", max_length=1200)
-    queries: list[str] = Field(default_factory=list, max_length=4)
-    subjects: list[str] = Field(default_factory=list, max_length=4)
+    semantic_query: str = Field(default="", max_length=1200)
+    anchors: list[str] = Field(default_factory=list, max_length=8)
     document_ids: list[str] = Field(default_factory=list, max_length=8)
     document_id: str | None = None
     section_selector: str = Field(default="", max_length=700)
@@ -48,7 +42,7 @@ class AgentDecision(BaseModel):
     selected_chunk_ids: list[str] = Field(default_factory=list, max_length=20)
     unresolved: list[str] = Field(default_factory=list, max_length=6)
 
-    @field_validator("queries", "subjects", "document_ids", "selected_chunk_ids", "unresolved", mode="before")
+    @field_validator("anchors", "document_ids", "selected_chunk_ids", "unresolved", mode="before")
     @classmethod
     def _coerce_empty_lists(cls, value):
         if value in (None, ""):
@@ -157,9 +151,9 @@ class AgenticQAService:
             items.append(compact)
 
         query_groups: list[dict] = []
-        group_item_limit = 8 if execution.tool == "search_lists" else 5
-        group_snippet_limit = 1200 if execution.tool == "search_lists" else 700
-        for group in execution.query_groups[:4]:
+        group_item_limit = 6
+        group_snippet_limit = 900
+        for group in execution.query_groups[:9]:
             group_items: list[dict] = []
             for item in (group.get("items") or [])[:group_item_limit]:
                 compact = {
@@ -187,7 +181,9 @@ class AgenticQAService:
                 group_items.append(compact)
             query_groups.append(
                 {
+                    "kind": group.get("kind"),
                     "query": group.get("query"),
+                    "anchor": group.get("anchor"),
                     "elapsed_ms": group.get("elapsed_ms"),
                     "items": group_items,
                 }
@@ -205,64 +201,34 @@ class AgenticQAService:
         catalog = json.dumps(CorpusMCPServer.tool_catalog(), ensure_ascii=False)
         return (
             "You are the research controller for an internal-document Q&A product. "
-            "Your job is to understand the user's natural-language request, choose one safe "
-            "read-only corpus tool at a time, inspect the returned evidence, and STOP as soon "
-            "as the actual user request is sufficiently supported. You do not answer from "
-            "your own knowledge. You do not force the question into a predefined intent "
-            "taxonomy. You do not invent additional requirements, scenarios, exceptions, "
-            "documents, entities or completeness conditions that the user did not ask for. "
-            "Search hypotheses may be broader than the final requirement, but they are only "
-            "search hypotheses and must never become new answer requirements. "
+            "Understand the user's request from natural language and decide the next evidence-gathering action. "
+            "Do not force questions into predefined types such as definition, multipart, enumeration, procedure, or constraint. "
+            "Do not answer from your own knowledge. Do not invent extra requirements, scenarios, exceptions, or source scope. "
             "\n\n"
-            "A simple question should normally take one good search and then finish. If a "
-            "result directly answers every requested part, select its chunk ids and finish; "
-            "do not keep researching for theoretical completeness. If you identify a document "
-            "whose title/section directly describes the user's requested event/topic and its "
-            "returned chunks contain the requested actors, facts or procedure, treat that as "
-            "strong evidence and finish unless a SPECIFIC user-requested part is still missing. "
-            "Never search the same document repeatedly just to discover unspecified extra cases. "
-            "For a request containing multiple independent categories, entities, or subquestions, "
-            "treat each requested part independently. Evidence that resolves one part must not "
-            "scope later searches for other unresolved parts to the same document unless the user "
-            "explicitly requested one common source. If a combined search is dominated by one part, "
-            "search each remaining part corpus-wide and keep the already-supported evidence. "
-            "For a request asking to list, name, enumerate, or provide all members of one or "
-            "more categories, prefer search_lists and provide one minimal semantic subject per "
-            "requested set (for example the category noun itself, not phrases like 'complete list "
-            "of ...' or 'names of ...'). Do not re-search a list subject already supported by a "
-            "direct list-bearing section. For other multi-part requests, prefer search_many with one semantic query per "
-            "part; do not concatenate independent parts into one retrieval query. "
+            "For ordinary evidence search use the generic search tool. Provide: "
+            "(1) semantic_query = the research question you want the corpus to answer, and "
+            "(2) anchors = literal strings whose identity matters and must not be lost during paraphrasing. "
+            "Anchors can be acronyms, names, codes, quoted phrases, section/rule identifiers, or any other literal terms you judge important. "
+            "Use the user's exact spelling for anchors whenever possible. The backend will search the semantic request and each anchor independently. "
+            "You decide whether one search is enough or whether several separate research actions are needed; application code does not decide this for you. "
             "\n\n"
-            "Tool guidance: use search_chunks as the default factual/procedural search for one need. Use "
-            "search_documents only when the user names or clearly refers to a document/source "
-            "and you need to resolve it. After resolving a document, use get_section directly "
-            "when the user supplied a specific chapter/section name or number; use search_sections "
-            "when the section identity is uncertain. Once two chunk searches point to the same likely "
-            "document or named section but details are still missing, switch to search_sections or "
-            "get_section instead of issuing another paraphrased chunk search. If search_lists returns a clearly matching list section but its snippet appears to start or end mid-list, use get_section on that document/section to retrieve the bounded adjacent chunks before finishing. Use get_document_structure for contents/hierarchy/list-of-sections "
-            "questions. When using get_document_structure for a requested structural category, put the user's own "
-            "category wording in the query field so the tool can filter the hierarchy. For a structure/list request, the hierarchy labels returned by get_document_structure are authoritative names as stored in the source. If the user explicitly asks for descriptive names/titles and a hierarchy item is only a bare number/identifier, inspect its child_headings and, if still useful, do one scoped search/exact lookup inside that document before finishing; never invent a missing title. Use search_tables for row/column/list/rate information. Use exact_lookup "
-            "for precise identifiers, rule numbers, quoted phrases or codes. "
+            "Use search_documents only when the user clearly names/refers to a source document and you need to resolve which uploaded document it is. "
+            "Use get_document_structure after a document is resolved when the user asks about its hierarchy/contents. "
+            "Use get_section after a document is resolved when you know the section/chapter selector to fetch. "
+            "Otherwise prefer generic search. "
             "\n\n"
-            "Never treat a role, station, equipment name or ordinary entity as a source document "
-            "just because a filename happens to contain the same token. A source is a source only "
-            "when the user's wording or a document-search result supports that relationship. "
-            "Preserve scope: when the user asks about a condition generally and results include both "
-            "a general procedure and a location-, equipment-, line-, or scenario-specific variant, "
-            "prefer the general procedure. Use a narrower variant only when the user asked for that "
-            "scope or when no broader evidence exists. Do not silently generalize a special case. "
+            "Never treat a role, station, equipment term, acronym, or ordinary entity as a source document merely because a filename contains it. "
+            "Search hypotheses may be broader than the final answer, but they are only hypotheses and must never become new answer requirements. "
+            "Preserve all parts the user actually asked for across successive searches. "
             "\n\n"
-            "When finishing, selected_chunk_ids must contain only chunk ids already returned by "
-            "tools. Select the smallest set that supports all explicitly requested parts. Unless "
-            "the user asks for all, complete, exhaustive, every, or an equivalent completeness "
-            "claim, do NOT mark the answer partial merely because additional duties, exceptions, "
-            "or scenarios might exist beyond what was asked. If an explicitly requested point "
-            "remains unsupported after useful attempts, finish with evidence_status=partial and "
-            "name only that concrete unresolved point; do not continue searching indefinitely. "
-            "\n\n"
-            "decision_summary is a brief operational justification, not hidden chain-of-thought. "
-            "Available tools:\n"
-            + catalog
+            "STOP as soon as the actual request is sufficiently supported. A simple question should usually need one search. "
+            "Do not silently upgrade an ordinary request into an exhaustive or complete investigation. "
+            "If current evidence directly supports every subject or point the user explicitly asked for, finish even if more related facts may exist. "
+            "When finishing, selected_chunk_ids must contain only chunk ids previously returned by tools. "
+            "Select the smallest evidence set that supports the requested answer. "
+            "If a specific requested point remains unsupported after useful attempts, finish partial and name only that point. "
+            "decision_summary is a short operational justification, not hidden chain-of-thought. "
+            "\n\nAvailable tools:\n" + catalog
         )
 
     def _controller_user_prompt(
@@ -282,39 +248,30 @@ class AgenticQAService:
             + json.dumps(history[-5:], ensure_ascii=False, indent=2)
             + "\n\nChoose the single next action. If current evidence already supports the "
             "user's actual request, choose finish now.\n\n"
-            "Return one JSON object with fields: action, decision_summary, query, queries, subjects, "
-            "document_ids, document_id, section_selector, evidence_status, "
-            "selected_chunk_ids, unresolved. Use empty strings/lists for unused fields."
+            "Return one JSON object with fields: action, decision_summary, semantic_query, anchors, "
+            "document_ids, document_id, section_selector, evidence_status, selected_chunk_ids, unresolved. "
+            "Use empty strings/lists for unused fields."
         )
 
     @staticmethod
     def _decision_arguments(decision: AgentDecision, question: str) -> dict:
+        if decision.action == "search":
+            return {
+                "semantic_query": decision.semantic_query.strip() or question,
+                "anchors": [value.strip() for value in decision.anchors if value.strip()],
+                "document_ids": decision.document_ids,
+            }
         if decision.action == "search_documents":
-            return {"query": decision.query.strip() or question}
-        if decision.action == "search_many":
-            return {
-                "queries": [value.strip() for value in decision.queries if value.strip()],
-                "document_ids": decision.document_ids,
-            }
-        if decision.action == "search_lists":
-            return {
-                "subjects": [value.strip() for value in decision.subjects if value.strip()],
-                "document_ids": decision.document_ids,
-            }
-        if decision.action in {"search_chunks", "search_sections", "search_tables", "exact_lookup"}:
-            return {
-                "query": decision.query.strip() or question,
-                "document_ids": decision.document_ids,
-            }
+            return {"query": decision.semantic_query.strip() or question}
         if decision.action == "get_document_structure":
             return {
                 "document_id": decision.document_id or "",
-                "query": decision.query.strip(),
+                "query": decision.semantic_query.strip(),
             }
         if decision.action == "get_section":
             return {
                 "document_id": decision.document_id or "",
-                "section_selector": decision.section_selector.strip() or decision.query.strip(),
+                "section_selector": decision.section_selector.strip() or decision.semantic_query.strip(),
             }
         return {}
 
@@ -325,7 +282,7 @@ class AgenticQAService:
         for raw in decisions:
             if not isinstance(raw, dict):
                 continue
-            values = [raw.get("query"), *(raw.get("queries") or [])]
+            values = [raw.get("semantic_query"), *(raw.get("anchors") or [])]
             for value in values:
                 cleaned = " ".join(str(value or "").split())
                 if not cleaned:
@@ -335,7 +292,7 @@ class AgenticQAService:
                     continue
                 seen.add(key)
                 parts.append(cleaned)
-                if len(parts) >= 5:
+                if len(parts) >= 8:
                     return " ; ".join(parts)
         return " ; ".join(parts)
 
@@ -376,7 +333,7 @@ class AgenticQAService:
         # for a similarly named concept. Structure/list outputs preserve source order.
         preserve_source_order = (
             (last_execution is not None and last_execution.tool in {
-                "get_document_structure", "get_section", "search_lists"
+                "get_document_structure", "get_section"
             })
             or any(
                 candidate.evidence_lane in {"document_structure", "section_navigation"}
@@ -530,29 +487,41 @@ class AgenticQAService:
                 # orchestration graph. Use a safe direct-search/finish fallback inside the
                 # agent itself.
                 if candidate_store:
-                    strongest = sorted(
-                        candidate_store.values(),
-                        key=self._candidate_rank,
-                        reverse=True,
-                    )[: min(6, self.settings.agent_max_evidence)]
+                    # A formatting failure after a focused search must not discard that
+                    # search's evidence in favour of unrelated globally high-scoring chunks.
+                    # Prefer the most recent tool result; fall back to the whole ledger only
+                    # when no tool result is available.
+                    fallback_candidates = (
+                        list(last_execution.candidates)
+                        if last_execution is not None and last_execution.candidates
+                        else sorted(
+                            candidate_store.values(),
+                            key=self._candidate_rank,
+                            reverse=True,
+                        )
+                    )
+                    fallback_candidates = fallback_candidates[
+                        : min(8, self.settings.agent_max_evidence)
+                    ]
                     decision = AgentDecision(
                         action="finish",
                         decision_summary=(
-                            "Controller output was invalid; use the strongest evidence already gathered."
+                            "Controller output was invalid; answer from the most recent focused evidence already gathered."
                         ),
                         evidence_status="partial",
                         selected_chunk_ids=[
-                            str(candidate.chunk_id) for candidate in strongest
+                            str(candidate.chunk_id) for candidate in fallback_candidates
                         ],
                         unresolved=[],
                     )
                 else:
                     decision = AgentDecision(
-                        action="search_chunks",
+                        action="search",
                         decision_summary=(
-                            "Controller output was invalid; run one direct hybrid corpus search."
+                            "Controller output was invalid; run one generic corpus search."
                         ),
-                        query=question,
+                        semantic_query=question,
+                        anchors=[],
                         evidence_status="insufficient",
                     )
             if (
@@ -764,7 +733,7 @@ class AgenticQAService:
 
         trace = {
             "agentic": True,
-            "agent_architecture": "bounded_mcp_tool_loop_v1",
+            "agent_architecture": "bounded_generic_corpus_tool_loop_v2",
             "agent_max_tool_calls": max_steps,
             "agent_decisions": decisions,
             "tool_calls": tool_traces,
