@@ -1,106 +1,172 @@
 from ike.services.query_debug import debug_report_markdown
 
 
-def test_debug_report_surfaces_semantic_queries_and_search_results():
+def test_debug_report_renders_v5_plan_research_and_selected_evidence():
     report = {
+        "debug_version": 5,
         "query_id": "00000000-0000-0000-0000-000000000001",
-        "created_at": "2026-10-03T10:00:00+00:00",
+        "created_at": "2026-10-06T10:00:00+00:00",
         "mode": "research",
-        "original_question": "Show the requested section from the rulebook",
-        "semantic_interpretation": "Navigate the named rulebook and explain the requested section.",
-        "answer_shape": "synthesis",
-        "source_hints": ["RULEBOOK"],
-        "entities": ["requested section", "RULEBOOK"],
-        "evidence_goals": [{
-            "id": "g1",
-            "kind": "overview",
-            "question": "Retrieve the requested section.",
-            "coverage_contract": "enumerate_set",
-            "retrieval_tools": ["section_navigation"],
-            "search_queries": ["requested section RULEBOOK"],
-        }],
-        "inferred_or_rephrased_queries": ["requested section RULEBOOK", "RULEBOOK requested section"],
-        "executed_search_queries": ["requested section RULEBOOK"],
-        "recovery_search_queries": ["RULEBOOK section heading"],
-        "search_results": [{
-            "debug_rank": 1,
-            "_trace_lane": "reranked_candidate_preview",
-            "document_title": "Rulebook.pdf",
-            "page_from": 12,
-            "section_path": ["PART VII"],
-            "rerank_score": 0.91,
-            "sources": ["section"],
-            "snippet": "PART VII ...",
-        }],
-        "goal_satisfaction": {"complete": True},
-        "recovery_summary": {},
-        "okf_resolution": {},
-        "corpus_discovery": {},
-        "final_answer": "Supported answer [E1].",
-        "citations": [],
-        "notes": [],
-    }
-
-    markdown = debug_report_markdown(report)
-
-    assert "AI interpretation" in markdown
-    assert "Inferred / rephrased search questions" in markdown
-    assert "Actually executed search queries" in markdown
-    assert "Recovery search queries" in markdown
-    assert "Rulebook.pdf" in markdown
-    assert "PART VII" in markdown
-
-
-def test_debug_report_renders_agent_tool_loop():
-    report = {
-        "query_id": "00000000-0000-0000-0000-000000000002",
-        "created_at": "2026-10-04T10:00:00+00:00",
-        "mode": "direct",
-        "original_question": "What should role A do during event B?",
-        "semantic_interpretation": "Search the documented responsibilities for role A during event B.",
-        "answer_shape": None,
-        "source_hints": [],
-        "entities": [],
-        "evidence_goals": [],
+        "original_question": "How many chapters are there in RULEBOOK?",
         "agentic": True,
-        "agent_architecture": "bounded_mcp_tool_loop_v1",
+        "agent_architecture": "planned_ai_research_v5",
+        "planner_model": "strong-model",
+        "planner_reasoning": "medium",
+        "answer_model": "strong-model",
+        "answer_reasoning": "medium",
         "agent_evidence_status": "sufficient",
-        "agent_stop_reason": "The procedure directly answers the request.",
-        "agent_unresolved": [],
-        "agent_decisions": [
-            {
-                "action": "search_chunks",
-                "decision_summary": "Search directly for the requested role and event.",
-            },
-            {
-                "action": "finish",
-                "decision_summary": "The procedure directly answers the request.",
-            },
-        ],
+        "agent_stop_reason": "answered_after_targeted_gap",
+        "research_plan": {
+            "interpretation": "Count and list the chapters of the named rulebook.",
+            "answer_requirements": ["chapter count", "chapter list"],
+            "tasks": [
+                {
+                    "id": "T1",
+                    "purpose": "Resolve the named rulebook.",
+                    "kind": "source_lookup",
+                    "source_query": "RULEBOOK",
+                    "depends_on": [],
+                }
+            ],
+        },
         "tool_calls": [
             {
-                "tool": "search_chunks",
-                "arguments": {"query": "role A event B procedure"},
-                "elapsed_ms": 120,
+                "round": "primary",
+                "task_id": "T1",
+                "purpose": "Resolve the named rulebook.",
+                "depends_on": [],
+                "tool": "source_lookup",
+                "arguments": {"query": "RULEBOOK"},
+                "metadata": {"candidate_count": 1},
+                "elapsed_ms": 20,
+                "note": "Document routing candidates.",
+                "items": [
+                    {
+                        "document_id": "00000000-0000-0000-0000-000000000010",
+                        "title": "Rulebook.pdf",
+                    }
+                ],
+            },
+            {
+                "round": "gap",
+                "task_id": "G1",
+                "purpose": "Inspect chapter hierarchy.",
+                "depends_on": [],
+                "tool": "structure",
+                "arguments": {
+                    "document_id": "00000000-0000-0000-0000-000000000010",
+                    "query": "chapter",
+                },
+                "metadata": {
+                    "matched_node_count": 13,
+                    "returned_node_count": 13,
+                    "truncated": False,
+                },
+                "elapsed_ms": 40,
+                "note": "Raw indexed hierarchy; the AI interprets the structure.",
+                "items": [
+                    {
+                        "evidence_id": "E1",
+                        "label": "CHAPTER I",
+                        "section_path": ["CHAPTER I"],
+                        "page_from": 1,
+                    }
+                ],
+            },
+        ],
+        "first_answer_decision": {
+            "status": "needs_evidence",
+            "missing_requirements": ["chapter hierarchy"],
+            "gap_tasks": [
+                {
+                    "id": "G1",
+                    "kind": "structure",
+                    "purpose": "Inspect chapter hierarchy.",
+                    "document_id": "00000000-0000-0000-0000-000000000010",
+                    "query": "chapter",
+                }
+            ],
+        },
+        "final_answer_decision": {
+            "answer": "There are 13 chapters. [E1]",
+            "selected_evidence_ids": ["E1"],
+            "confidence": "high",
+        },
+        "completed_task_ids": ["T1", "G1"],
+        "skipped_task_ids": [],
+        "selected_evidence": [
+            {
+                "rank": 1,
+                "document_title": "Rulebook.pdf",
+                "page_from": 1,
+                "section_path": ["CHAPTER I"],
+                "chunk_id": "00000000-0000-0000-0000-000000000020",
+                "snippet": "Chapter I source text",
             }
         ],
-        "inferred_or_rephrased_queries": ["role A event B procedure"],
-        "executed_search_queries": ["role A event B procedure"],
-        "recovery_search_queries": [],
-        "per_query_search_results": [],
-        "search_results": [],
-        "goal_satisfaction": None,
-        "recovery_summary": {},
-        "okf_resolution": {},
-        "corpus_discovery": {},
-        "final_answer": "Role A should follow the documented procedure [E1].",
+        "workflow_timings_ms": {
+            "planning": 1500,
+            "primary_research": 20,
+            "evidence_reasoning": 1200,
+            "gap_research": 40,
+            "final_reasoning": 1000,
+            "agent_total": 3760,
+        },
+        "final_answer": "There are 13 chapters. [E1]",
+        "citations": [{"evidence_id": "E1"}],
+        "notes": [],
+    }
+
+    markdown = debug_report_markdown(report)
+
+    assert "planned_ai_research_v5" in markdown
+    assert "Query Intelligence plan" in markdown
+    assert "Resolve the named rulebook" in markdown
+    assert "targeted gap research" in markdown
+    assert "Rulebook.pdf" in markdown
+    assert "CHAPTER I" in markdown
+    assert "AI-selected evidence" in markdown
+    assert "There are 13 chapters" in markdown
+
+
+def test_debug_report_renders_primary_answer_without_gap_round():
+    report = {
+        "debug_version": 5,
+        "query_id": "00000000-0000-0000-0000-000000000002",
+        "created_at": "2026-10-06T10:00:00+00:00",
+        "mode": "direct",
+        "original_question": "What is SS/UI?",
+        "agent_architecture": "planned_ai_research_v5",
+        "planner_model": "strong-model",
+        "planner_reasoning": "medium",
+        "answer_model": "strong-model",
+        "answer_reasoning": "medium",
+        "agent_evidence_status": "sufficient",
+        "agent_stop_reason": "answered_from_primary_research",
+        "research_plan": {
+            "interpretation": "Define SS/UI.",
+            "answer_requirements": ["definition"],
+            "tasks": [],
+        },
+        "tool_calls": [],
+        "first_answer_decision": {
+            "status": "answer",
+            "answer": "Definition. [E1]",
+            "selected_evidence_ids": ["E1"],
+            "confidence": "high",
+        },
+        "final_answer_decision": {},
+        "completed_task_ids": [],
+        "skipped_task_ids": [],
+        "selected_evidence": [],
+        "workflow_timings_ms": {},
+        "final_answer": "Definition. [E1]",
         "citations": [],
         "notes": [],
     }
 
     markdown = debug_report_markdown(report)
 
-    assert "Agent research loop" in markdown
-    assert "bounded_mcp_tool_loop_v1" in markdown
-    assert "search_chunks" in markdown
-    assert "The procedure directly answers the request." in markdown
+    assert "answered_from_primary_research" in markdown
+    assert "First evidence/answer decision" in markdown
+    assert "Final decision after targeted gap research" not in markdown

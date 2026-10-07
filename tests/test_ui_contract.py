@@ -4,14 +4,14 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 def test_primary_ask_ui_is_chat_composer_driven_and_reports_are_folded_into_ask():
-    html = (ROOT / "src" / "ike" / "web" / "templates" / "index.html").read_text(encoding="utf-8")
+    html = (ROOT / "src" / "ike" / "frontend" / "templates" / "index.html").read_text(encoding="utf-8")
     assert 'data-tab="ask"' in html
     assert 'data-tab="history"' in html
     assert "My Questions" in html
     assert 'id="queryMode"' in html
-    assert '<option value="auto">Auto</option>' in html
-    assert '<option value="direct">Direct</option>' in html
-    assert '<option value="research">Research</option>' in html
+    assert '<option value="auto">' not in html
+    assert '<option value="direct">Quick Answer</option>' in html
+    assert '<option value="research" selected>Comprehensive</option>' in html
     assert '<option value="deep">Deep Analysis</option>' in html
     assert "Deep Analysis" in html
     assert 'data-tab="reports"' not in html
@@ -23,7 +23,7 @@ def test_primary_ask_ui_is_chat_composer_driven_and_reports_are_folded_into_ask(
 
 
 def test_browser_streams_qa_auto_scrolls_progress_and_polls_deep_analysis_without_carryover():
-    js = (ROOT / "src" / "ike" / "web" / "static" / "app.js").read_text(encoding="utf-8")
+    js = (ROOT / "src" / "ike" / "frontend" / "static" / "app.js").read_text(encoding="utf-8")
     assert "/api/v1/query/stream" in js
     assert "/api/v1/query/history" in js
     assert "/api/v1/reports" in js
@@ -37,9 +37,9 @@ def test_browser_streams_qa_auto_scrolls_progress_and_polls_deep_analysis_withou
 
 
 def test_answer_first_sidebar_activity_drawer_and_pdf_search_are_present():
-    html = (ROOT / "src" / "ike" / "web" / "templates" / "index.html").read_text(encoding="utf-8")
-    css = (ROOT / "src" / "ike" / "web" / "static" / "app.css").read_text(encoding="utf-8")
-    js = (ROOT / "src" / "ike" / "web" / "static" / "app.js").read_text(encoding="utf-8")
+    html = (ROOT / "src" / "ike" / "frontend" / "templates" / "index.html").read_text(encoding="utf-8")
+    css = (ROOT / "src" / "ike" / "frontend" / "static" / "app.css").read_text(encoding="utf-8")
+    js = (ROOT / "src" / "ike" / "frontend" / "static" / "app.js").read_text(encoding="utf-8")
     assert 'class="workspace-sidebar"' in html
     assert 'id="activityDrawer" class="activity-drawer"' in html
     assert 'id="activityToggle"' in html
@@ -60,9 +60,9 @@ def test_answer_first_sidebar_activity_drawer_and_pdf_search_are_present():
 
 
 def test_mobile_theme_and_personal_library_controls_are_present():
-    html = (ROOT / "src" / "ike" / "web" / "templates" / "index.html").read_text(encoding="utf-8")
-    css = (ROOT / "src" / "ike" / "web" / "static" / "app.css").read_text(encoding="utf-8")
-    js = (ROOT / "src" / "ike" / "web" / "static" / "app.js").read_text(encoding="utf-8")
+    html = (ROOT / "src" / "ike" / "frontend" / "templates" / "index.html").read_text(encoding="utf-8")
+    css = (ROOT / "src" / "ike" / "frontend" / "static" / "app.css").read_text(encoding="utf-8")
+    js = (ROOT / "src" / "ike" / "frontend" / "static" / "app.js").read_text(encoding="utf-8")
     assert 'data-tab="library"' in html
     assert "My PDFs" in html
     assert 'id="themeToggle"' in html
@@ -74,15 +74,15 @@ def test_mobile_theme_and_personal_library_controls_are_present():
 
 
 def test_admin_user_management_remains_separate_from_user_history():
-    html = (ROOT / "src" / "ike" / "web" / "templates" / "index.html").read_text(encoding="utf-8")
-    js = (ROOT / "src" / "ike" / "web" / "static" / "app.js").read_text(encoding="utf-8")
+    html = (ROOT / "src" / "ike" / "frontend" / "templates" / "index.html").read_text(encoding="utf-8")
+    js = (ROOT / "src" / "ike" / "frontend" / "static" / "app.js").read_text(encoding="utf-8")
     assert 'data-tab="users"' in html
     assert "/api/v1/auth/users" in js
     assert "/api/v1/query/history" in js
 
 
 def test_dmrc_ims_branding_is_visible_and_internal_namespace_is_not_required_in_ui():
-    html = (ROOT / "src" / "ike" / "web" / "templates" / "index.html").read_text(encoding="utf-8")
+    html = (ROOT / "src" / "ike" / "frontend" / "templates" / "index.html").read_text(encoding="utf-8")
     config = (ROOT / "src" / "ike" / "core" / "config.py").read_text(encoding="utf-8")
     env = (ROOT / ".env.example").read_text(encoding="utf-8")
     assert "Incident Management System" in html
@@ -95,7 +95,7 @@ def test_dmrc_ims_branding_is_visible_and_internal_namespace_is_not_required_in_
 
 
 def test_frontend_assets_are_release_versioned_to_prevent_mixed_ui_cache():
-    html = (ROOT / "src" / "ike" / "web" / "templates" / "index.html").read_text(encoding="utf-8")
+    html = (ROOT / "src" / "ike" / "frontend" / "templates" / "index.html").read_text(encoding="utf-8")
     main = (ROOT / "src" / "ike" / "main.py").read_text(encoding="utf-8")
     assert '/static/app.css?v={{ app_version }}' in html
     assert '/static/app.js?v={{ app_version }}' in html

@@ -21,7 +21,7 @@ def test_visuals_are_lazy_acl_checked_and_server_path_derived():
 def test_visuals_are_rendered_from_retrieved_evidence_without_reprocessing():
     execution = read("src/ike/services/query_execution.py")
     service = read("src/ike/services/visuals.py")
-    js = read("src/ike/web/static/app.js")
+    js = read("src/ike/frontend/static/app.js")
     assert "resolve_visual_evidence" in execution
     assert "candidate.page_from" in service
     assert "candidate.source_metadata" in service

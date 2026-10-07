@@ -10,7 +10,17 @@ from fastapi.templating import Jinja2Templates
 from prometheus_client import CONTENT_TYPE_LATEST, Counter, Histogram, generate_latest
 
 from ike import __version__
-from ike.api.routes import auth, dashboard, debug, documents, health, library, query, reports, visuals
+from ike.api.routes import (
+    auth,
+    dashboard,
+    debug,
+    documents,
+    health,
+    library,
+    query,
+    reports,
+    visuals,
+)
 from ike.core.config import get_settings
 from ike.core.logging import configure_logging
 from ike.services.bootstrap import ensure_bootstrap_admin
@@ -74,7 +84,7 @@ app.include_router(visuals.router, prefix="/api/v1")
 app.include_router(reports.router, prefix="/api/v1")
 app.include_router(debug.router, prefix="/api/v1")
 
-web_root = Path(__file__).parent / "web"
+web_root = Path(__file__).parent / "frontend"
 app.mount("/static", StaticFiles(directory=web_root / "static"), name="static")
 templates = Jinja2Templates(directory=web_root / "templates")
 

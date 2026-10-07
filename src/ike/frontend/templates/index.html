@@ -1,0 +1,312 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="color-scheme" content="light dark">
+  <title>IMS | {{ organization_short_name }}</title>
+  <link rel="stylesheet" href="/static/app.css?v={{ app_version }}">
+</head>
+<body data-theme="light" data-app-version="{{ app_version }}" data-report-max-documents="{{ report_max_documents }}">
+  <header class="topbar">
+    <a class="brand" href="#" aria-label="IMS home">
+      <span class="brand-mark">IMS</span>
+      <span class="brand-copy">
+        <strong>Incident Management System</strong>
+        <small>{{ organization_short_name }}</small>
+      </span>
+    </a>
+    <div class="top-actions">
+      <button id="activityToggle" class="icon-button" type="button" title="Activity and recent questions" aria-label="Open activity">◷</button>
+      <button id="themeToggle" class="icon-button" type="button" title="Switch theme" aria-label="Switch theme">☾</button>
+      <div id="userBox" class="user-box"></div>
+    </div>
+  </header>
+
+  <main class="app-main">
+    <section id="loginPanel" class="card auth-card">
+      <div class="login-brand">
+        <span class="login-brand-mark">IMS</span>
+        <div>
+          <h1>Incident Management System</h1>
+          <p>{{ organization_name }}</p>
+        </div>
+      </div>
+      <h2 class="sign-in-heading">Sign in</h2>
+      <form id="loginForm">
+        <label>Username<input id="username" autocomplete="username" required></label>
+        <label>Password<input id="password" type="password" autocomplete="current-password" required></label>
+        <button class="primary wide">Sign in</button>
+      </form>
+      <p id="loginError" class="status-message error"></p>
+    </section>
+
+    <section id="appPanel" class="hidden">
+      <div class="app-shell">
+        <aside class="workspace-sidebar" aria-label="Workspace navigation and Ask controls">
+          <div class="sidebar-label">Workspace</div>
+          <nav class="app-nav" aria-label="Main navigation">
+            <button data-tab="ask" class="nav-button active"><span class="nav-icon">⌕</span><span>Q&amp;A</span></button>
+            {% comment %} <button data-tab="realtime" class="nav-button"><span class="nav-icon">⚡</span><span>Real-Time IMS</span></button> {% endcomment %}
+            <button data-tab="history" class="nav-button"><span class="nav-icon">◷</span><span>My Questions</span></button>
+            <button data-tab="documents" class="nav-button"><span class="nav-icon">▤</span><span>Knowledge</span></button>
+            <button data-tab="library" class="nav-button"><span class="nav-icon">▣</span><span>My PDFs</span></button>
+            <button id="usersTabButton" data-tab="users" class="nav-button hidden"><span class="nav-icon">◎</span><span>Users</span></button>
+          </nav>
+
+          <section class="sidebar-query-controls" aria-label="Ask IMS controls">
+            <div class="sidebar-section-head"><span>Ask controls</span><button id="modeInfoBtn" class="mini-info" type="button" aria-label="Answer mode guide" title="Answer mode guide">i</button></div>
+            <label class="sidebar-control" for="queryMode">
+              <span>Mode</span>
+              <select id="queryMode" aria-label="Answer mode">
+                {% comment %} <option value="direct">Quick Answer</option> {% endcomment %}
+                <option value="research" selected>Comprehensive</option>
+                {% comment %} <option value="deep">Deep Analysis</option> {% endcomment %}
+              </select>
+            </label>
+            <p id="modeHint" class="sidebar-hint">Broad evidence search, coverage checks and verification.</p>
+
+            <label class="sidebar-control" for="queryScope">
+              <span>Sources</span>
+              <select id="queryScope" aria-label="PDF source scope">
+                <option value="all">All available</option>
+                <option value="knowledge">Knowledge</option>
+                <option value="personal">My PDFs</option>
+                <option value="selected">Selected PDFs</option>
+              </select>
+            </label>
+            <button id="choosePdfsBtn" class="sidebar-action" type="button" aria-expanded="false">
+              <span>Select PDFs</span><strong id="selectedDocCount">0</strong>
+            </button>
+
+            <section id="selectedSourcePanel" class="sidebar-source-picker hidden" aria-label="Selected PDF picker">
+              <div class="source-picker-head">
+                <div><strong>Choose PDFs</strong><span id="sourcePickerSummary" class="subtle">0 selected</span></div>
+                <button id="clearSelectedDocs" class="link-button" type="button">Clear</button>
+              </div>
+              <input id="queryDocumentSearch" class="picker-search" type="search" placeholder="Search ready PDFs">
+              <div id="queryDocuments" class="document-picker sidebar-document-picker"></div>
+            </section>
+          </section>
+
+          <button id="activitySidebarBtn" class="sidebar-action sidebar-activity" type="button"><span>Activity &amp; recent</span><span>›</span></button>
+          <div class="sidebar-note">
+            <strong>Ask naturally</strong>
+            {% comment %} <span>You do not need exact manual terminology. IMS preserves your wording, expands supported terminology and adds useful related context from authorised sources.</span> {% endcomment %}
+          </div>
+        </aside>
+
+        <section class="workspace-main">
+          <section id="tab-ask" class="tab-content ask-tab">
+            <div class="ask-workspace">
+              <div class="ask-page-head">
+                <div>
+                  <span class="eyebrow">Document intelligence</span>
+                  <h1>Ask IMS</h1>
+                  {% comment %} <p>Search your authorised knowledge and personal PDFs. Each question is interpreted independently; prior questions never silently constrain the next search.</p> {% endcomment %}
+                </div>
+              </div>
+
+
+              <div id="conversationScroll" class="conversation-scroll" aria-live="polite">
+                <section id="activeQuery" class="active-query">
+                  <div class="empty-answer">
+                    <span class="empty-mark">⌕</span>
+                    <h2>Ask across your documents</h2>
+                    {% comment %} <p>Ask in your own words. IMS will preserve literal terms, expand supported terminology and surface materially relevant context from your authorised PDFs.</p> {% endcomment %}
+                  </div>
+                </section>
+              </div>
+
+              <div class="composer-zone">
+                <section class="ask-composer card">
+                  <div class="composer-input-row">
+                    <textarea id="question" class="question-input" rows="1" placeholder="Ask IMS naturally — exact manual wording is not required..." aria-label="Question"></textarea>
+                    <button id="askBtn" class="primary ask-button" type="button"><span id="askBtnLabel">Ask</span><span class="send-glyph">↑</span></button>
+                  </div>
+                  <div class="composer-foot">
+                    {% comment %} <span class="subtle">Answers stay grounded in authorised PDFs and may include useful related conditions, exceptions and scenarios.</span> {% endcomment %}
+                    <span class="keyboard-hint">Enter to send · Shift+Enter for a new line</span>
+                  </div>
+                  <div id="queryStatus" class="status-message error"></div>
+                </section>
+              </div>
+            </div>
+          </section>
+
+
+          <section id="tab-realtime" class="tab-content hidden realtime-tab">
+            <div class="realtime-workspace">
+              <div class="ask-page-head realtime-head">
+                <div><span class="eyebrow">Operational decision support</span><h1>Real-Time IMS</h1><p>Set the operating context once, then report the condition in short natural language.</p></div>
+                <span class="realtime-badge">FAST PATH</span>
+              </div>
+              <section id="realtimeSetup" class="realtime-setup">
+                <div class="card realtime-context-card">
+                  <h2>Set operational context</h2>
+                  <p class="subtle">All context fields are optional. Add only what is useful for this session; IMS will use them to narrow the starting corpus and widen logically when needed.</p>
+                  <div class="realtime-context-grid">
+                    <label>Line <span class="optional">optional</span><select id="rtLine"><option value="">Select line</option><option>Line 1</option><option>Line 2</option><option>Line 3</option><option>Line 4</option><option>Line 5</option><option>Line 6</option><option>Line 7</option><option>Line 8</option><option>Line 9</option><option>Airport Express</option></select></label>
+                    <label>Rolling stock <span class="optional">optional</span><select id="rtRollingStock"><option value="">Not specified</option><option>RS1</option><option>RS2</option><option>RS3</option><option>RS4</option><option>RS5</option><option>RS6</option></select></label>
+                    <label>Operational role <span class="optional">optional</span><select id="rtRole"><option value="">Select role</option><option>TO</option><option>RA</option><option>ETO</option><option>TC</option><option>SC</option><option>SM</option><option>IC</option><option>Other</option></select></label>
+                    <label>Department <span class="optional">optional</span><input id="rtDepartment" placeholder="e.g. Operations"></label>
+                    <label>Operating mode<select id="rtMode"><option value="">Not specified</option><option>UTO</option><option>ATO</option><option>ATP</option><option>CM</option><option>RM</option><option>Manual</option></select></label>
+                    <label>Location type<select id="rtLocationType"><option value="">Not specified</option><option>Elevated</option><option>Underground</option><option>At-grade</option><option>Station</option><option>Depot</option></select></label>
+                  </div>
+                  <label>Station / section <span class="optional">optional</span><input id="rtStation" placeholder="e.g. between Station A and Station B"></label>
+                  <button id="startRealtime" class="primary">Start Real-Time Session</button>
+                  <div id="rtSetupStatus" class="status-message error"></div>
+                </div>
+              </section>
+              <section id="realtimeSession" class="hidden realtime-session">
+                <div class="realtime-context-bar"><div><strong>⚡ REAL-TIME</strong><span id="rtContextSummary"></span></div><button id="changeRealtimeContext" class="secondary">Change context</button></div>
+                <div id="rtConversationScroll" class="conversation-scroll realtime-conversation"><section id="rtActiveQuery" class="active-query"><div class="empty-answer"><span class="empty-mark">⚡</span><h2>Report the condition</h2><p>Use short operational language, for example “wind 65”, “wrong station announcement”, or “doors not closing”.</p></div></section></div>
+                <div class="composer-zone"><section class="ask-composer card"><div class="composer-input-row"><textarea id="rtQuestion" class="question-input" rows="1" placeholder="Describe the condition or ask what to do..." aria-label="Real-time question"></textarea><button id="rtAskBtn" class="primary ask-button" type="button"><span>Ask</span><span class="send-glyph">↑</span></button></div><div class="composer-foot"><span class="subtle">Fast bounded retrieval using the active operational context.</span><span class="keyboard-hint">Enter to send · Shift+Enter for a new line</span></div><div id="rtStatus" class="status-message error"></div></section></div>
+              </section>
+            </div>
+          </section>
+
+          <section id="tab-history" class="tab-content hidden">
+            <div class="page-head">
+              <div><h1>My Questions</h1><p>Answers and deep analyses from your account.</p></div>
+              <div class="head-actions"><input id="historySearch" type="search" placeholder="Search questions and answers"><button id="refreshHistory" class="secondary">Refresh</button></div>
+            </div>
+            <div id="questionHistory" class="history-grid"></div>
+          </section>
+
+          <section id="tab-documents" class="tab-content hidden fixed-page-tab">
+            <div class="page-head">
+              <div><h1>Knowledge</h1><p>Organisation documents available to you.</p></div>
+              <button id="refreshDocs" class="secondary">Refresh</button>
+            </div>
+            <div class="library-layout viewport-library">
+              <section id="uploadCard" class="card upload-card scroll-card">
+                <h2>Upload to Knowledge</h2>
+                <form id="uploadForm">
+                  <label>PDFs<input id="docFile" name="file" type="file" accept="application/pdf,.pdf" multiple required></label>
+                  <label>Title <span class="optional">optional for a single PDF</span><input id="docTitle" name="title" placeholder="Defaults to filename"></label>
+                  <details>
+                    <summary>Document metadata</summary>
+                    <label>Document family / policy ID<input name="family_key"></label>
+                    <div class="field-row"><label>Revision<input name="revision"></label><label>Authority<input name="authority"></label></div>
+                    <label>Department<input name="department"></label>
+                    <label>Access<select name="access_scope"><option value="organization">Organisation</option><option value="department">Department</option><option value="restricted">Restricted</option></select></label>
+                    <label>Allowed roles<input name="allowed_roles" placeholder="analyst,user"></label>
+                    <label>Allowed departments<input name="allowed_departments"></label>
+                  </details>
+                  <button class="primary wide">Upload</button>
+                </form>
+                <div id="uploadStatus" class="status-message"></div>
+              </section>
+              <section class="card list-card document-list-card">
+                <div id="documentStats" class="stats-row"></div>
+                <div class="pdf-toolbar">
+                  <input id="documentSearch" type="search" placeholder="Search Knowledge PDFs">
+                  <select id="documentStatusFilter" aria-label="Knowledge PDF status">
+                    <option value="all">All statuses</option>
+                    <option value="ready">Ready</option>
+                    <option value="indexing">Indexing</option>
+                    <option value="failed">Failed</option>
+                  </select>
+                </div>
+                <div id="documentListMeta" class="list-meta"></div>
+                <div id="documentList" class="document-scroll"></div>
+              </section>
+            </div>
+          </section>
+
+          <section id="tab-library" class="tab-content hidden fixed-page-tab">
+            <div class="page-head">
+              <div><h1>My PDFs</h1><p>Your PDFs and PDFs shared with you.</p></div>
+              <button id="refreshLibrary" class="secondary">Refresh</button>
+            </div>
+            <div class="library-layout viewport-library">
+              <section class="card upload-card scroll-card">
+                <h2>Add PDF</h2>
+                <form id="personalUploadForm">
+                  <label>PDFs<input id="personalDocFile" type="file" accept="application/pdf,.pdf" multiple required></label>
+                  <label>Title <span class="optional">optional for a single PDF</span><input id="personalDocTitle" placeholder="Defaults to filename"></label>
+                  <div class="field-label">Share with <span class="optional">optional</span></div>
+                  <div id="personalUploadShares" class="user-picker"></div>
+                  <button class="primary wide">Upload to My PDFs</button>
+                </form>
+                <div id="personalUploadStatus" class="status-message"></div>
+              </section>
+              <section class="card list-card document-list-card">
+                <div id="personalStats" class="stats-row"></div>
+                <div class="pdf-toolbar">
+                  <input id="personalDocumentSearch" type="search" placeholder="Search My PDFs">
+                  <select id="personalStatusFilter" aria-label="Personal PDF status">
+                    <option value="all">All statuses</option>
+                    <option value="ready">Ready</option>
+                    <option value="indexing">Indexing</option>
+                    <option value="failed">Failed</option>
+                  </select>
+                </div>
+                <div id="personalListMeta" class="list-meta"></div>
+                <div id="personalDocumentList" class="document-scroll"></div>
+              </section>
+            </div>
+          </section>
+
+          <section id="tab-users" class="tab-content hidden">
+            <div class="page-head"><div><h1>Users</h1><p>Accounts for organisation testing.</p></div><button id="refreshUsers" class="secondary">Refresh</button></div>
+            <div class="library-layout">
+              <section class="card upload-card">
+                <h2>Create user</h2>
+                <form id="userForm">
+                  <label>Username<input id="newUsername" minlength="3" maxlength="120" required></label>
+                  <label>Temporary password<input id="newUserPassword" type="password" minlength="12" required></label>
+                  <div class="field-row"><label>Role<select id="newUserRole"><option value="user">User</option><option value="analyst">Analyst</option><option value="admin">Admin</option></select></label><label>Department<input id="newUserDepartment" maxlength="120"></label></div>
+                  <button class="primary wide">Create account</button>
+                </form>
+                <div id="userStatus" class="status-message"></div>
+              </section>
+              <section class="card list-card"><div id="userList"></div></section>
+            </div>
+          </section>
+        </section>
+
+      </div>
+
+      <div id="activityBackdrop" class="drawer-backdrop hidden" aria-hidden="true"></div>
+      <aside id="activityDrawer" class="activity-drawer" aria-label="User activity summary" aria-hidden="true">
+        <div class="drawer-head"><div><span class="eyebrow">Workspace</span><h2>Activity</h2></div><button id="activityClose" class="icon-button" type="button" aria-label="Close activity">×</button></div>
+        <section class="card profile-card">
+          <div id="profileAvatar" class="profile-avatar">U</div>
+          <div class="profile-copy"><strong id="profileUsername">User</strong><span id="profileRole">User</span><small id="profileDepartment"></small></div>
+        </section>
+        <section class="card insight-card">
+          <div class="rail-heading"><strong>Your activity</strong><span>Live summary</span></div>
+          <div id="dashboardStats" class="dashboard-stats">
+            <div><strong>—</strong><span>Questions</span></div><div><strong>—</strong><span>PDFs</span></div><div><strong>—</strong><span>Ready</span></div><div><strong>—</strong><span>Indexing</span></div>
+          </div>
+        </section>
+        <section class="card insight-card recent-card">
+          <div class="rail-heading"><strong>Recent questions</strong><button id="viewAllHistory" class="link-button" type="button">View all</button></div>
+          <div id="recentQuestionList" class="recent-question-list"><p class="subtle">No recent questions yet.</p></div>
+        </section>
+      </aside>
+    </section>
+  </main>
+
+  <dialog id="modeGuide" class="modal">
+    <div class="modal-head"><div><h2>Answer modes</h2><p>Choose based on the job, not answer length.</p></div><button class="icon-button modal-close" data-close-modal="modeGuide" aria-label="Close">×</button></div>
+    <div class="mode-guide-grid">
+      <article><span class="mode-tag">Auto</span><h3>Let the app decide</h3><p>Starts with the efficient path and moves to Research when the question clearly needs broader coverage.</p><div class="example"><strong>Example</strong><span>“What is BIC?” → Direct-style answer.<br>“Compare BIC use across all manuals.” → Research.</span></div></article>
+      <article><span class="mode-tag">Direct</span><h3>Fast, focused answer</h3><p>One bounded search and rerank pass. Best for definitions, values, clauses and focused procedures.</p><div class="example"><strong>Example</strong><span>“What is the maximum speed in RM mode?” → concise answer with the strongest citations.</span></div></article>
+      <article><span class="mode-tag">Research</span><h3>Broader evidence search</h3><p>Expands the question, searches more broadly, synthesises across sources and verifies the answer.</p><div class="example"><strong>Example</strong><span>“List all conditions and exceptions for door isolation across the manuals.”</span></div></article>
+      <article><span class="mode-tag">Deep Analysis</span><h3>Fuller document analysis</h3><p>Asynchronous section-by-section analysis over the chosen PDFs. Use for reviews, comparisons and long structured outputs.</p><div class="example"><strong>Example</strong><span>“Compare these three OTMs and identify operational differences, conflicts and risks.”</span></div></article>
+    </div>
+  </dialog>
+
+  <dialog id="shareModal" class="modal share-modal">
+    <div class="modal-head"><div><h2>Manage access</h2><p id="shareModalTitle"></p></div><button class="icon-button modal-close" data-close-modal="shareModal" aria-label="Close">×</button></div>
+    <div id="shareUserPicker" class="user-picker tall"></div>
+    <div class="modal-actions"><button class="secondary" data-close-modal="shareModal">Cancel</button><button id="saveShares" class="primary">Save access</button></div>
+    <div id="shareStatus" class="status-message"></div>
+  </dialog>
+
+  <script src="/static/app.js?v={{ app_version }}"></script>
+</body>
+</html>

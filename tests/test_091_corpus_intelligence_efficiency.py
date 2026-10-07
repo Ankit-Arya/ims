@@ -7,8 +7,8 @@ from ike.retrieval.corpus_intelligence import (
 )
 
 
-def test_index_version_is_091():
-    assert INDEX_VERSION == "0.9.1"
+def test_index_version_matches_current_schema():
+    assert INDEX_VERSION == "0.10.0"
 
 
 def test_centroid_reuses_existing_vectors_and_normalizes():

@@ -1,241 +1,267 @@
-# Architecture — 0.9.0
+# IMS Architecture — Planned AI Research v5
 
-## Runtime topology
+This document describes the current Q&A runtime and where each responsibility lives.
 
-```text
-Users -> Nginx/HTTPS -> api-1 + api-2 -> PostgreSQL/Valkey -> inference-query (BGE-M3 + reranker)
-PDF queue -> worker(concurrency=1) -> Docling/OCR -> inference-ingest (BGE-M3 only)
-```
-
-The online and background ML planes use the same embedding model/version but different processes, locks, CPU sets and memory ceilings. Background ingestion cannot acquire the live query embedding gate. APIs remain lightweight and share no conversational Q&A memory. ACL filtering still occurs before evidence reaches an LLM.
-
-The current VM starting split is CPUs `0-5` online and `6-7` background; treat it as a measured starting configuration rather than universal tuning. Existing vectors remain `BAAI/bge-m3`, dimension 1024.
-
-Ask is answer-first: navigation and query controls are on the left; activity is an optional drawer. Visual evidence is lazily rendered only from retrieved/authorised source pages.
-
----
-
-## Q&A retrieval control plane in 0.8.0
-
-Online Q&A now uses an evidence-driven staged control flow. Administrator-configured or explicitly selected priority sources are searched before the wider corpus. Retrieval combines dense, precise lexical, relaxed lexical, section-navigation and exact/lookup evidence, then reranks required evidence goals independently. A semantic evidence-quality gate decides whether the source-local result is sufficient; incomplete goals receive a materially different search-only repair pass before any broad fallback.
+## Source tree
 
 ```text
-question -> evidence plan -> source policy
-         -> priority retrieval -> goal-local rerank -> evidence audit
-              | complete                         | incomplete
-              v                                  v
-            answer                 source-local query repair
-                                                   |
-                                                   v
-                                      broad unresolved goals only
-                                                   |
-                                                   v
-                                      synthesis -> verification
+src/ike/
+├── main.py
+├── frontend/                 Browser UI only
+├── api/                      HTTP/SSE boundary
+├── services/
+│   ├── query_execution.py    Single Q&A application entrypoint
+│   ├── query_debug.py        Per-query forensic report
+│   ├── llm.py                OpenAI structured-output wrapper
+│   └── inference_client.py   Query embedding service client
+├── agent/
+│   ├── models.py             Research-plan / answer schemas
+│   ├── prompts.py            Query-intelligence + answer contracts
+│   ├── query_intelligence.py AI query understanding / research planning
+│   ├── research.py           Bounded execution of the AI-created research graph
+│   ├── tools.py              Fast access-safe retrieval primitives
+│   ├── answer.py             Evidence reasoning + final answer agent
+│   └── service.py            v5 orchestration
+├── retrieval/
+│   ├── search_engine.py      Dense / lexical / exact primitives
+│   ├── fusion.py             Reciprocal-rank fusion
+│   ├── evidence_selection.py Mechanical duplicate removal
+│   ├── search_plan.py        Low-level token helpers
+│   ├── table_context.py      Retrieval text representation
+│   ├── corpus_intelligence.py
+│   ├── access.py             ACL SQL predicates
+│   └── types.py              Candidate / Evidence types
+├── ingestion/                PDF parsing, OCR, chunking, indexing
+├── reports/                  Deep Analysis workflow
+├── tasks/
+│   ├── celery_app.py
+│   ├── ingestion.py
+│   ├── reports.py
+│   └── worker_bootstrap.py
+├── db/
+├── schemas/
+└── core/
 ```
 
-Search hypotheses are never evidence. ACL filtering remains inside every retrieval SQL path. Existing `chunks.section_path` and `search_vector` provide section navigation without a schema migration.
+There is one normal Q&A runtime. The old deterministic QA graph, MCP controller loop,
+coverage-saturation policies and mandatory cross-encoder reranker are not part of it.
 
-
-## Q&A industrial retrieval fabric in 0.9.0
-
-0.9 adds a secondary hierarchy and adaptive query orchestration without replacing the source chunk store.
+## End-to-end flow
 
 ```text
-PostgreSQL
-├── documents
-├── chunks                 source evidence + BGE-M3 + FTS
-└── retrieval_nodes        routing hierarchy
-    ├── document
-    ├── section
-    └── concept
+User question
+    │
+    ▼
+Query Intelligence Agent
+    │
+    ├─ interprets natural language / shorthand / acronyms
+    ├─ identifies every answer requirement
+    ├─ understands independent vs correlated vs dependent needs
+    ├─ rewrites retrieval queries
+    ├─ preserves exact identifiers
+    └─ creates a minimal research graph
+    │
+    ▼
+Research Executor
+    │
+    ├─ executes AI-created tasks within ACL/time bounds
+    ├─ source_lookup
+    ├─ search (lexical / semantic / hybrid chosen by AI)
+    ├─ structure inspection
+    └─ context inspection
+    │
+    ▼
+Evidence + Answer Agent
+    │
+    ├─ decides which evidence is applicable
+    ├─ reasons across multiple requirements and conditions
+    ├─ detects conflicts / missing operational steps
+    ├─ selects documentary evidence
+    └─ either answers OR requests one precise gap round
+    │
+    ├──────────── sufficient ────────────► Final answer
+    │
+    └──── material gap
+              │
+              ▼
+       Targeted gap research
+              │
+              ▼
+       Final Answer Agent
+              │
+              ▼
+         QueryLog / UI
 ```
 
-At query time the hierarchy supplies corpus vocabulary and likely source documents/families. The API then chooses a retrieval effort:
+Ordinary questions therefore require two AI decisions:
+
+1. query intelligence / research plan;
+2. evidence reasoning + final answer.
+
+A third AI decision occurs only when the first evidence pass identifies a concrete
+material gap.
+
+## Semantic ownership
+
+### AI owns
+
+- what the user means;
+- inferred and explicit conditions;
+- query expansion / rephrasing;
+- decomposition of multi-part questions;
+- relationships between research requirements;
+- retrieval mode (lexical / semantic / hybrid);
+- literal terms that must be preserved;
+- source-routing intent;
+- whether evidence applies to the stated situation;
+- whether a threshold alone is enough or surrounding procedure is needed;
+- whether one targeted follow-up search is necessary;
+- final evidence selection;
+- final answer organization and wording.
+
+### Python owns
+
+- authentication and ACLs;
+- database access;
+- exact / FTS / vector retrieval execution;
+- reciprocal-rank fusion;
+- mechanical duplicate removal;
+- context-window retrieval;
+- execution of task dependencies created by the AI;
+- hard research-time / evidence / token bounds;
+- LLM request timeout / retries;
+- citation bookkeeping;
+- persistence, metrics and cancellation.
+
+Python does not decide semantic completeness, source applicability or what the answer
+should mean.
+
+## Fast retrieval
+
+A normal search task does only the retrieval modes requested by the planner.
+
+### lexical
 
 ```text
-FAST     -> bounded lookup/fact/primary definition
-FOCUSED  -> procedure/condition/relationship with routed source scope
-RESEARCH -> enumeration, variants, multi-entity, comparison, multi-goal and coverage
+PostgreSQL FTS
++ exact query
++ AI-selected exact phrases
+        │
+        ▼
+       RRF
 ```
 
-Configured priority sources are probed first with a small profile. Incomplete Fast/Focused queries use corpus-routed hybrid retrieval before escalation. Research questions keep independent evidence branches and broad coverage.
-
-Independent goal reranks can be sent to `/rerank/batch`, which performs one cross-encoder scheduling window and reconstructs rankings per goal. During rolling deployment the 0.9 inference client falls back to legacy serial `/rerank` if the batch endpoint is not yet available.
-
-The evidence lifecycle is monotonic at the level that matters: passages explicitly relied on by a prior semantic goal audit are protected. Recovery for unresolved goals is admitted before unused residual candidates, so a full earlier top-k does not block better evidence.
-
-Final drafting uses adaptive goal-balanced evidence budgets rather than the entire retrieval pool. The trace records exactly which evidence IDs/chunks/documents entered the final prompt.
-
-The secondary hierarchy is ACL-aware and fail-open: absence/failure of `retrieval_nodes` disables routing intelligence but does not bypass authorization or invalidate normal chunk retrieval.
-
-
-## Historical / earlier-release notes
-
-
-## Design rules
-
-IKE 0.4 follows these rules:
-
-1. **Parsing quality precedes retrieval quality.** PDF structure, tables, OCR and page provenance are first-class.
-2. **Retrieval is deterministic and measurable.** Hybrid candidate generation + learned reranking, not agent improvisation.
-3. **Workflow complexity is conditional.** Focused questions stay cheap; broader questions can expand/verify; Deep Analysis runs a separate coverage-oriented workflow.
-4. **Every question is independent.** History is not conversational context.
-5. **Authorization is applied before evidence enters the model context.**
-6. **Organisation knowledge and personal PDFs are distinct workspaces with different ownership semantics.**
-7. **Deep Analysis is an answer mode in the product, but remains an asynchronous backend workflow.**
-8. **Ingestion throughput is bounded by both CPU and memory.**
-9. **UI adapts to viewport and colour preference rather than assuming a desktop.**
-
-## Document workspace model
-
-### Organisation Knowledge
-
-`documents.workspace_scope = organization`
-
-Access follows organisation/department/restricted ACL metadata. Admins can manage the organisation corpus; analyst uploaders can manage their own organisation uploads.
-
-### Personal library
-
-`documents.workspace_scope = personal`
-
-Access is:
+### semantic
 
 ```text
-owner
-OR
-EXISTS(document_shares WHERE user_id = current_user)
+one query embedding
++ pgvector search
 ```
 
-There is deliberately no `admin OR ...` bypass inside the normal product predicate for personal documents.
-
-`document_shares` records explicit user grants. Shares cascade away with the document.
-
-## Retrieval authorization
-
-The access predicate is embedded into document/chunk queries before dense/lexical/exact evidence is returned. This avoids the unsafe design:
+### hybrid
 
 ```text
-retrieve everything -> filter forbidden results later
+FTS ────────┐
+exact ──────┼─► RRF ► evidence candidates
+dense ──────┘
 ```
 
-and instead uses:
+There is no mandatory cross-encoder reranking and no hidden per-anchor lexical fan-out.
+
+The final AI model performs the semantic relevance judgment over the returned evidence.
+
+## Complex queries
+
+The planner can produce multiple research tasks.
+
+Example:
 
 ```text
-current user ACL -> candidate retrieval -> reranking -> model evidence
+"If A and B happened, while C was unavailable, what should X and Y do?"
+
+T1: establish consequence of A
+T2: establish consequence of B
+T3: determine rule/procedure for unavailable C
+T4: establish X responsibilities under A+B+C
+T5: establish Y responsibilities under A+B+C
 ```
 
-## Q&A workflows
+Tasks can carry `depends_on` relationships. Python executes that graph but does not
+invent the relationships.
 
-### Direct
+If a truly dependent search cannot be formulated until retrieved evidence reveals a
+specific fact, the first evidence/answer pass creates the targeted gap task.
+
+## Operational context expansion
+
+`inspect_context` is intentionally cheap and available for procedure questions.
+
+If search returns:
 
 ```text
-question
-  -> hybrid candidate retrieval
-  -> RRF fusion
-  -> local cross-encoder rerank
-  -> compact evidence set
-  -> fast LLM
-  -> citations
+3-6 BIC -> 10 km/h
 ```
 
-### Research
+but the user asks what must actually be done, the answer agent can request context around
+that chunk rather than launch another broad corpus search.
+
+This exposes nearby stop / bypass / mode / detrain / depot instructions in source order.
+
+## Answer behavior
+
+Answers should be:
+
+- direct;
+- complete for the requested conditions;
+- grounded in selected documentary evidence;
+- operationally useful when the question is operational;
+- concise for simple facts and appropriately structured for complex cases.
+
+The system does not append generic uncertainty boilerplate.
+
+A missing detail is mentioned only when it materially changes the answer or action, and
+the wording must identify the specific missing fact rather than advertise retrieval
+weakness.
+
+## Reliability / latency bounds
+
+Current local defaults:
 
 ```text
-question
-  -> query expansion
-  -> broader hybrid retrieval
-  -> rerank
-  -> structural evidence expansion
-  -> strong LLM synthesis
-  -> support/citation verification
+primary research budget : 20 seconds
+targeted gap budget     : 10 seconds
+gap rounds              : 1
+gap tasks                : max 3
+search evidence          : max 14 default / 24 hard per task
+final selected evidence : max 40
+planner reasoning        : medium
+answer reasoning         : medium
+LLM request timeout      : 120 seconds
+LLM retries              : 1
 ```
 
-### Auto
+These are engineering ceilings, not semantic rules.
 
-Obvious broad/complex prompts route directly to Research. Otherwise Auto first takes the efficient evidence path and upgrades only when the workflow rules indicate broader work is required.
+## Debugging a query
 
-## Deep Analysis workflow
+The downloadable query debug report now shows:
 
-Deep Analysis is surfaced beside Auto/Direct/Research in Ask, but uses `/reports` and a background worker because its workload is fundamentally different:
+1. original question;
+2. Query Intelligence interpretation;
+3. answer requirements;
+4. research tasks and dependencies;
+5. each retrieval operation and elapsed time;
+6. first evidence/answer decision;
+7. targeted gap request, if any;
+8. final evidence selection;
+9. final answer and timings.
+
+The key distinction is visible in the trace:
 
 ```text
-selected accessible PDFs
-  -> enumerate source chunks/sections
-  -> build bounded analysis packs
-  -> parallel map analysis
-  -> hierarchical reduction
-  -> final synthesis
-  -> citation validation
-  -> result in My Questions
+AI decided what to research
+        ↓
+Python executed it
+        ↓
+AI decided what the evidence means
 ```
-
-This prevents a long document comparison from being reduced to ordinary top-k RAG.
-
-The browser polls persisted progress (`stage`, `percent`, `message`) and renders it in the same current-request area used by normal Q&A.
-
-## Responsive UI architecture
-
-The server ships a small dependency-free HTML/CSS/JS UI. Important properties:
-
-- viewport meta configured for phone screens;
-- fluid container widths;
-- desktop/tablet grid layouts collapse to a single column;
-- navigation becomes a fixed bottom bar on phone widths;
-- answer-mode buttons become horizontally scrollable where needed;
-- tables use their own horizontal overflow container;
-- dialogs use viewport-bounded width/height;
-- light/dark design tokens are CSS custom properties;
-- theme preference is stored in browser `localStorage`.
-
-No server-side theme state is required.
-
-## Ingestion architecture
-
-```text
-PDF upload
-   -> immutable source storage
-   -> Celery ingestion queue
-   -> CPU/RAM-aware worker bootstrap
-   -> N prefork document processes
-       -> cached Docling pipeline per process
-       -> Tesseract OCR (1 OpenMP thread per invocation)
-       -> canonical document + hybrid chunks
-       -> batched embedding calls
-       -> PostgreSQL/pgvector
-```
-
-### Concurrency calculation
-
-With `INGEST_WORKER_CONCURRENCY=auto`, the worker computes:
-
-```text
-target_threads = floor(logical_cpus * target_percent)
-cpu_limit      = floor(target_threads / docling_threads_per_document)
-memory_limit   = floor((memory - reserve) / estimated_memory_per_process)
-concurrency    = min(max_concurrency, cpu_limit, memory_limit)
-```
-
-All values are clamped to at least one process.
-
-This is intentionally safer than mapping “80% CPU” directly to Celery processes, because each Docling worker process can consume substantial RAM and each process also has internal CPU parallelism.
-
-## Local inference
-
-Embeddings and reranking run through a private inference service so models are loaded once per service rather than separately into the FastAPI process.
-
-The application uses:
-
-- BAAI/bge-m3 embeddings;
-- BAAI/bge-reranker-v2-m3 cross-encoder reranking;
-- PostgreSQL + pgvector for persistence/search.
-
-## Queues
-
-- `ingestion` — CPU-heavy PDF parsing/indexing.
-- `reports` — LLM-heavy Deep Analysis jobs.
-
-Separating the queues prevents a large report from blocking PDF processing or vice versa.
-
-## Data ownership
-
-PostgreSQL is the system of record for metadata, ACLs, shares, chunks, queries, reports and feedback. Source/parsed document files live on the shared persistent data volume. Valkey is coordination/queue infrastructure, not the primary record.

@@ -11,7 +11,8 @@ logger = logging.getLogger(__name__)
 def _memory_gb() -> float:
     # Respect a Docker/cgroup memory ceiling when one is configured.
     try:
-        raw = open("/sys/fs/cgroup/memory.max", encoding="utf-8").read().strip()
+        with open("/sys/fs/cgroup/memory.max", encoding="utf-8") as handle:
+            raw = handle.read().strip()
         if raw and raw != "max":
             return int(raw) / 1024 / 1024 / 1024
     except (OSError, ValueError):
@@ -44,7 +45,9 @@ def calculate_concurrency() -> tuple[int, dict[str, float | int]]:
         try:
             chosen = max(1, int(override))
         except ValueError as exc:
-            raise SystemExit("INGEST_WORKER_CONCURRENCY must be 'auto' or a positive integer") from exc
+            raise SystemExit(
+                "INGEST_WORKER_CONCURRENCY must be 'auto' or a positive integer"
+            ) from exc
     else:
         chosen = automatic
 
@@ -62,7 +65,6 @@ def calculate_concurrency() -> tuple[int, dict[str, float | int]]:
 
 
 def main() -> None:
-    settings = get_settings()
     concurrency, details = calculate_concurrency()
     print(
         "IKE ingestion worker: "
@@ -74,6 +76,8 @@ def main() -> None:
         "celery",
         "-A",
         "ike.tasks.celery_app:celery_app",
+        "-I",
+        "ike.tasks.ingestion",
         "worker",
         "--loglevel=INFO",
         "-Q",

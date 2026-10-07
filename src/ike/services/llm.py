@@ -1,8 +1,8 @@
 import json
 import logging
 import re
-from dataclasses import dataclass
 from collections.abc import Callable
+from dataclasses import dataclass
 from typing import Any, TypeVar
 
 from openai import OpenAI
@@ -29,7 +29,12 @@ class LLMClient:
         self.settings = get_settings()
         if not self.settings.openai_api_key:
             raise RuntimeError("OPENAI_API_KEY is not configured")
-        self.client = OpenAI(api_key=self.settings.openai_api_key, base_url=self.settings.openai_base_url)
+        self.client = OpenAI(
+            api_key=self.settings.openai_api_key,
+            base_url=self.settings.openai_base_url,
+            timeout=self.settings.llm_request_timeout_seconds,
+            max_retries=self.settings.llm_max_retries,
+        )
 
     def generate(
         self,
@@ -39,11 +44,14 @@ class LLMClient:
         strong: bool = False,
         max_output_tokens: int | None = None,
         json_mode: bool = False,
+        reasoning_effort: str | None = None,
         on_delta: Callable[[str], None] | None = None,
         cancel_check: Callable[[], None] | None = None,
     ) -> LLMResult:
         model = self.settings.llm_strong_model if strong else self.settings.llm_fast_model
-        effort = self.settings.llm_strong_reasoning if strong else self.settings.llm_fast_reasoning
+        effort = reasoning_effort or (
+            self.settings.llm_strong_reasoning if strong else self.settings.llm_fast_reasoning
+        )
         request: dict[str, Any] = {
             "model": model,
             "instructions": system,
@@ -91,8 +99,9 @@ class LLMClient:
             close = getattr(stream, "close", None)
             if callable(close):
                 close()
-        return LLMResult(text="".join(parts).strip(), input_tokens=input_tokens, output_tokens=output_tokens)
-
+        return LLMResult(
+            text="".join(parts).strip(), input_tokens=input_tokens, output_tokens=output_tokens
+        )
 
     def generate_structured(
         self,
@@ -102,6 +111,7 @@ class LLMClient:
         schema_model: type[StructuredModelT],
         strong: bool = False,
         max_output_tokens: int = 1600,
+        reasoning_effort: str | None = None,
     ) -> tuple[StructuredModelT, LLMResult]:
         """Generate schema-constrained planner output with SDK/Pydantic validation.
 
@@ -111,7 +121,9 @@ class LLMClient:
         """
 
         model = self.settings.llm_strong_model if strong else self.settings.llm_fast_model
-        effort = self.settings.llm_strong_reasoning if strong else self.settings.llm_fast_reasoning
+        effort = reasoning_effort or (
+            self.settings.llm_strong_reasoning if strong else self.settings.llm_fast_reasoning
+        )
         response = self.client.responses.parse(
             model=model,
             instructions=system,
@@ -134,7 +146,9 @@ class LLMClient:
         )
         return parsed, result
 
-    def generate_json(self, *, system: str, user: str, strong: bool = False, max_output_tokens: int = 1600) -> tuple[Any, LLMResult]:
+    def generate_json(
+        self, *, system: str, user: str, strong: bool = False, max_output_tokens: int = 1600
+    ) -> tuple[Any, LLMResult]:
         result = self.generate(
             system=system,
             user=user + "\n\nReturn only valid JSON. Do not wrap it in Markdown.",
@@ -148,7 +162,7 @@ class LLMClient:
             text = match.group(1).strip()
         try:
             return json.loads(text), result
-        except json.JSONDecodeError:
+        except json.JSONDecodeError as exc:
             # Some models occasionally prepend/append a tiny amount of prose despite JSON
             # mode. Recover the outermost JSON object before giving up.
             start = text.find("{")
@@ -160,4 +174,4 @@ class LLMClient:
                 except json.JSONDecodeError:
                     pass
             logger.warning("llm_json_parse_failed", extra={"payload": text[:1000]})
-            raise ValueError("Model returned invalid JSON")
+            raise ValueError("Model returned invalid JSON") from exc

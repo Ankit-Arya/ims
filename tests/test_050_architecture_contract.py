@@ -59,14 +59,38 @@ def test_additive_query_indexes_do_not_rewrite_embeddings():
     assert "embedding =" not in migration
 
 
-def test_role_coverage_uses_single_structural_sql_discovery_query():
-    source = Path('src/ike/retrieval/engine.py').read_text(encoding='utf-8')
-    assert 'role_structural' in source
-    assert 'role_coverage_sql_queries' in source
-    assert 'tsquery_text' in source
+def test_v5_agent_has_planner_research_and_answer_boundaries():
+    service = read("src/ike/agent/service.py")
+    planner = read("src/ike/agent/query_intelligence.py")
+    answer = read("src/ike/agent/answer.py")
+    research = read("src/ike/agent/research.py")
+    tools = read("src/ike/agent/tools.py")
+    search = read("src/ike/retrieval/search_engine.py")
+
+    assert "QueryIntelligenceAgent" in service
+    assert "EvidenceAnswerAgent" in service
+    assert "ResearchExecutor" in service
+    assert "generate_structured" in planner
+    assert "generate_structured" in answer
+    assert "strong=True" in planner
+    assert "strong=True" in answer
+    assert "requirement_assessments" in answer
+
+    assert "enumerate" in tools
+    assert "search_documents" in tools
+    assert "inspect_structure" in tools
+    assert "inspect_context" in tools
+    assert "_expand_requested_context" in research
+    assert "source_hint" not in tools
+    assert "structure_complete" not in tools
+
+    assert "class SearchEngine" in search
+    assert "coverage_status" not in search
+    assert "saturation" not in search
+    assert "QueryPlan" not in search
 
 
 def test_api_image_contains_release_benchmark_tools():
-    dockerfile = Path('docker/api.Dockerfile').read_text(encoding='utf-8')
-    assert 'COPY scripts ./scripts' in dockerfile
-    assert 'COPY eval ./eval' in dockerfile
+    dockerfile = Path("docker/api.Dockerfile").read_text(encoding="utf-8")
+    assert "COPY scripts ./scripts" in dockerfile
+    assert "COPY eval ./eval" in dockerfile

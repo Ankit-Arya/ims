@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Iterable
 from typing import Any
 from uuid import UUID
 
@@ -20,225 +19,129 @@ def _as_list(value: Any) -> list:
     return value if isinstance(value, list) else []
 
 
-def _unique_strings(values: Iterable[Any], limit: int = 200) -> list[str]:
-    result: list[str] = []
-    seen: set[str] = set()
-    for raw in values:
-        value = " ".join(str(raw or "").split())
-        if not value:
-            continue
-        key = value.casefold()
-        if key in seen:
-            continue
-        seen.add(key)
-        result.append(value)
-        if len(result) >= limit:
-            break
-    return result
+def _cell(value: Any) -> str:
+    return str(value if value is not None else "").replace("|", "\\|").replace("\n", " ")
 
 
-def _flatten_strings(value: Any) -> list[str]:
-    result: list[str] = []
-    if isinstance(value, str):
-        return [value]
-    if isinstance(value, list):
-        for item in value:
-            result.extend(_flatten_strings(item))
-    elif isinstance(value, dict):
-        for item in value.values():
-            result.extend(_flatten_strings(item))
-    return result
-
-
-def _candidate_rows(trace: dict) -> list[dict]:
-    rows: list[dict] = []
-    for key in ("fused_candidate_preview", "reranked_candidate_preview", "evidence"):
-        for raw in _as_list(trace.get(key)):
-            if isinstance(raw, dict):
-                item = dict(raw)
-                item["_trace_lane"] = key
-                rows.append(item)
-
-    recovery = _as_dict(trace.get("recovery_summary"))
-    for key in ("fused_candidate_preview", "reranked_candidate_preview", "evidence"):
-        for raw in _as_list(recovery.get(key)):
-            if isinstance(raw, dict):
-                item = dict(raw)
-                item["_trace_lane"] = "recovery." + key
-                rows.append(item)
-
-    seen: set[str] = set()
-    result: list[dict] = []
-    for row in rows:
-        chunk_id = str(row.get("chunk_id") or "").strip()
-        identity = chunk_id or json.dumps(row, sort_keys=True, default=str)
-        if identity in seen:
-            continue
-        seen.add(identity)
-        result.append(row)
-        if len(result) >= 120:
-            break
-    return result
-
-
-def _enrich_candidates(db: Session, user: User, candidates: list[dict]) -> list[dict]:
-    ids: list[UUID] = []
-    for row in candidates:
+def _selected_evidence(
+    db: Session,
+    user: User,
+    trace: dict,
+) -> list[dict]:
+    ordered_ids: list[UUID] = []
+    for raw in _as_list(trace.get("selected_chunk_ids")):
         try:
-            ids.append(UUID(str(row.get("chunk_id"))))
+            value = UUID(str(raw))
         except (TypeError, ValueError):
             continue
-    ids = list(dict.fromkeys(ids))
-    if not ids:
-        return candidates
+        if value not in ordered_ids:
+            ordered_ids.append(value)
+    if not ordered_ids:
+        return []
 
     rows = db.execute(
         select(Chunk, Document)
         .join(Document, Document.id == Chunk.document_id)
         .where(
-            Chunk.id.in_(ids),
+            Chunk.id.in_(ordered_ids),
             document_access_clause(user),
             Document.ingestion_status == "ready",
         )
     ).all()
-    by_id = {str(chunk.id): (chunk, document) for chunk, document in rows}
+    by_id = {chunk.id: (chunk, document) for chunk, document in rows}
 
-    enriched: list[dict] = []
-    for rank, raw in enumerate(candidates, start=1):
-        row = dict(raw)
-        row["debug_rank"] = rank
-        pair = by_id.get(str(row.get("chunk_id") or ""))
-        if pair is not None:
-            chunk, document = pair
-            row.setdefault("document_id", str(document.id))
-            row.setdefault("document_title", document.title)
-            row.setdefault("filename", document.original_filename)
-            row.setdefault("page_from", chunk.page_from)
-            row.setdefault("page_to", chunk.page_to)
-            row.setdefault("section_path", chunk.section_path or [])
-            row.setdefault("content_kind", chunk.content_kind)
-            row["snippet"] = " ".join((chunk.text or "").split())[:1600]
-        enriched.append(row)
-    return enriched
-
-
-def build_query_debug_report(db: Session, user: User, log: QueryLog) -> dict:
-    trace = _as_dict(log.retrieval_trace)
-    query_plan = _as_dict(trace.get("query_plan"))
-    query_frame = _as_dict(trace.get("query_frame"))
-    evidence_plan = _as_dict(trace.get("evidence_plan"))
-    recovery = _as_dict(trace.get("recovery_summary"))
-
-    goal_queries: list[str] = []
-    goal_rows: list[dict] = []
-    for raw_goal in _as_list(evidence_plan.get("goals")):
-        if not isinstance(raw_goal, dict):
+    result: list[dict] = []
+    for rank, chunk_id in enumerate(ordered_ids, start=1):
+        pair = by_id.get(chunk_id)
+        if pair is None:
             continue
-        goal = dict(raw_goal)
-        goal_rows.append(goal)
-        goal_queries.extend(_as_list(goal.get("search_queries")))
+        chunk, document = pair
+        result.append(
+            {
+                "rank": rank,
+                "chunk_id": str(chunk.id),
+                "document_id": str(document.id),
+                "document_title": document.title,
+                "filename": document.original_filename,
+                "page_from": chunk.page_from,
+                "page_to": chunk.page_to,
+                "section_path": chunk.section_path or [],
+                "content_kind": chunk.content_kind,
+                "snippet": " ".join((chunk.text or "").split())[:1800],
+            }
+        )
+    return result
 
-    inferred_queries = _unique_strings([
-        *_as_list(query_plan.get("semantic_queries")),
-        *_as_list(query_plan.get("lexical_queries")),
-        *_as_list(query_plan.get("exact_terms")),
-        *_as_list(query_frame.get("alternate_phrasings")),
-        *_as_list(query_frame.get("canonical_terms")),
-        *goal_queries,
-    ])
-    executed_queries = _unique_strings([
-        *_as_list(trace.get("queries")),
-        *[
-            item.get("text")
-            for item in _as_list(trace.get("query_specs"))
-            if isinstance(item, dict)
-        ],
-    ])
-    recovery_queries = _unique_strings([
-        *_flatten_strings(trace.get("recovery_queries")),
-        *_flatten_strings(recovery.get("recovery_queries")),
-        *_flatten_strings(recovery.get("enumeration_section_rediscovery_queries")),
-    ])
-    per_query_results: list[dict] = []
-    preview_groups = [
-        ("initial", _as_list(trace.get("query_result_previews"))),
-        ("recovery", _as_list(recovery.get("query_result_previews"))),
+
+def _tool_summary(call: dict) -> dict:
+    return {
+        "round": call.get("round"),
+        "task_id": call.get("task_id"),
+        "purpose": call.get("purpose"),
+        "depends_on": _as_list(call.get("depends_on")),
+        "tool": call.get("tool"),
+        "arguments": _as_dict(call.get("arguments")),
+        "metadata": _as_dict(call.get("metadata")),
+        "elapsed_ms": call.get("elapsed_ms"),
+        "note": call.get("note"),
+        "items": _as_list(call.get("items")),
+    }
+
+
+def build_query_debug_report(
+    db: Session,
+    user: User,
+    log: QueryLog,
+) -> dict:
+    """Build a v5 planned-research diagnostic from the persisted query trace."""
+
+    trace = _as_dict(log.retrieval_trace)
+    tool_calls = [
+        _tool_summary(value)
+        for value in _as_list(trace.get("tool_calls"))
+        if isinstance(value, dict)
     ]
-    for phase, previews in preview_groups:
-        for raw_preview in previews:
-            if not isinstance(raw_preview, dict):
-                continue
-            per_query_results.append({
-                "phase": phase,
-                "query_index": raw_preview.get("query_index"),
-                "query": raw_preview.get("query"),
-                "goal_ids": raw_preview.get("goal_ids") or [],
-                "goal_kinds": raw_preview.get("goal_kinds") or [],
-                "origins": raw_preview.get("origins") or [],
-                "results": _enrich_candidates(db, user, _as_list(raw_preview.get("results"))),
-            })
-
-    agent_decisions = _as_list(trace.get("agent_decisions"))
-    agent_interpretation = ""
-    if agent_decisions and isinstance(agent_decisions[0], dict):
-        agent_interpretation = str(agent_decisions[0].get("decision_summary") or "")
 
     return {
-        "debug_version": 2,
+        "debug_version": 5,
         "query_id": str(log.id),
         "created_at": log.created_at.isoformat() if log.created_at else None,
         "original_question": log.question,
         "mode": log.mode,
         "agentic": bool(trace.get("agentic")),
         "agent_architecture": trace.get("agent_architecture"),
-        "agent_decisions": agent_decisions,
-        "tool_calls": _as_list(trace.get("tool_calls")),
-        "agent_stop_reason": trace.get("agent_stop_reason"),
+        "planner_model": trace.get("planner_model"),
+        "planner_reasoning": trace.get("planner_reasoning"),
+        "answer_model": trace.get("answer_model"),
+        "answer_reasoning": trace.get("answer_reasoning"),
+        "research_plan": _as_dict(trace.get("research_plan")),
+        "first_answer_decision": _as_dict(trace.get("first_answer_decision")),
+        "final_answer_decision": _as_dict(trace.get("final_answer_decision")),
+        "tool_calls": tool_calls,
+        "completed_task_ids": _as_list(trace.get("completed_task_ids")),
+        "skipped_task_ids": _as_list(trace.get("skipped_task_ids")),
+        "selected_evidence_ids": _as_list(trace.get("selected_evidence_ids")),
+        "selected_chunk_ids": _as_list(trace.get("selected_chunk_ids")),
+        "selected_evidence": _selected_evidence(db, user, trace),
         "agent_evidence_status": trace.get("agent_evidence_status"),
-        "agent_unresolved": trace.get("agent_unresolved") or [],
-        "semantic_interpretation": (
-            evidence_plan.get("interpretation")
-            or agent_interpretation
-            or query_frame.get("original")
-        ),
-        "answer_shape": evidence_plan.get("answer_shape") or query_frame.get("answer_shape"),
-        "source_hints": evidence_plan.get("source_hints") or query_frame.get("explicit_scope") or [],
-        "entities": evidence_plan.get("entities") or query_frame.get("entities") or [],
-        "evidence_goals": goal_rows,
-        "inferred_or_rephrased_queries": inferred_queries,
-        "executed_search_queries": executed_queries,
-        "recovery_search_queries": recovery_queries,
-        "per_query_search_results": per_query_results,
-        "corpus_discovery": trace.get("corpus_discovery"),
-        "okf_resolution": trace.get("okf_resolution"),
-        "query_plan": query_plan,
-        "query_frame": query_frame,
-        "search_results": _enrich_candidates(db, user, _candidate_rows(trace)),
-        "source_counts": trace.get("source_counts"),
-        "rerank_details": trace.get("rerank_details"),
-        "goal_satisfaction": trace.get("goal_satisfaction"),
-        "retrieval_quality_issues": trace.get("retrieval_quality_issues"),
-        "recovery_attempted": trace.get("recovery_attempted"),
-        "recovery_summary": recovery,
-        "workflow_timings_ms": trace.get("workflow_timings_ms"),
+        "agent_stop_reason": trace.get("agent_stop_reason"),
+        "workflow_timings_ms": _as_dict(trace.get("workflow_timings_ms")),
         "final_answer": log.answer,
         "citations": log.citations or [],
         "notes": [
-            "Search queries and corpus hints are retrieval hypotheses, not answer evidence.",
-            "Search results are reconstructed from stored candidate/evidence previews and enriched with accessible chunk text.",
-            "This artifact is intended for testing and acceptance diagnostics.",
+            "The Query Intelligence Agent creates the research graph.",
+            "Python executes retrieval tasks and resource limits but does not decide semantic sufficiency.",
+            "The Evidence/Answer Agent selects applicability, requests at most one targeted gap round, and writes the answer.",
+            "Selected evidence is reloaded through the current user's ACL for this diagnostic.",
         ],
     }
-
-
-def _cell(value: Any) -> str:
-    return str(value if value is not None else "").replace("|", "\\|").replace("\n", " ")
 
 
 def debug_report_markdown(report: dict) -> str:
     lines = [
         "# IMS Query Debug Report",
         "",
+        "- Debug version: " + _cell(report.get("debug_version")),
         "- Query ID: " + _cell(report.get("query_id")),
         "- Created: " + _cell(report.get("created_at")),
         "- Mode: " + _cell(report.get("mode")),
@@ -247,179 +150,204 @@ def debug_report_markdown(report: dict) -> str:
         "",
         str(report.get("original_question") or ""),
         "",
-        "## AI interpretation",
+        "## AI runtime",
         "",
-        "- Interpretation: " + _cell(report.get("semantic_interpretation")),
-        "- Answer shape: " + _cell(report.get("answer_shape")),
-        "- Source hints: " + (", ".join(str(x) for x in (report.get("source_hints") or [])) or "none"),
-        "- Entities: " + (", ".join(str(x) for x in (report.get("entities") or [])) or "none"),
+        "- Architecture: " + _cell(report.get("agent_architecture")),
+        "- Planner: "
+        + _cell(report.get("planner_model"))
+        + " / "
+        + _cell(report.get("planner_reasoning")),
+        "- Answer agent: "
+        + _cell(report.get("answer_model"))
+        + " / "
+        + _cell(report.get("answer_reasoning")),
+        "- Evidence status: " + _cell(report.get("agent_evidence_status")),
+        "- Stop reason: " + _cell(report.get("agent_stop_reason")),
+        "",
+        "## Query Intelligence plan",
+        "",
+        "~~~json",
+        json.dumps(
+            report.get("research_plan"),
+            ensure_ascii=False,
+            indent=2,
+            default=str,
+        ),
+        "~~~",
+        "",
+        "## Research task execution",
         "",
     ]
 
-    if report.get("agentic"):
-        lines.extend([
-            "## Agent research loop",
+    tool_calls = report.get("tool_calls") or []
+    if not tool_calls:
+        lines.append("- No retrieval tasks were executed.")
+    for index, call in enumerate(tool_calls, start=1):
+        lines.extend(
+            [
+                f"### {index}. {_cell(call.get('task_id'))} / {_cell(call.get('tool'))}",
+                "",
+                "- Round: " + _cell(call.get("round")),
+                "- Purpose: " + _cell(call.get("purpose")),
+                "- Depends on: "
+                + (
+                    ", ".join(str(value) for value in call.get("depends_on") or [])
+                    or "none"
+                ),
+                "- Arguments: " + _cell(call.get("arguments")),
+                "- Elapsed: " + _cell(call.get("elapsed_ms")) + " ms",
+                "- Metadata: " + _cell(call.get("metadata")),
+                "- Note: " + _cell(call.get("note")),
+            ]
+        )
+        items = call.get("items") or []
+        if items:
+            lines.extend(
+                [
+                    "",
+                    "| # | Evidence | Document | Page | Section / label | Observation |",
+                    "|---:|---|---|---:|---|---|",
+                ]
+            )
+            for item_index, item in enumerate(items[:40], start=1):
+                if not isinstance(item, dict):
+                    continue
+                section_path = item.get("section_path") or []
+                section = (
+                    " > ".join(str(value) for value in section_path)
+                    if section_path
+                    else item.get("label")
+                )
+                observation = (
+                    item.get("snippet")
+                    or item.get("title")
+                    or item.get("filename")
+                    or ""
+                )
+                lines.append(
+                    "| "
+                    + str(item_index)
+                    + " | "
+                    + _cell(item.get("evidence_id"))
+                    + " | "
+                    + _cell(item.get("document_title") or item.get("title"))
+                    + " | "
+                    + _cell(item.get("page_from"))
+                    + " | "
+                    + _cell(section)
+                    + " | "
+                    + _cell(str(observation)[:700])
+                    + " |"
+                )
+        lines.append("")
+
+    lines.extend(
+        [
+            "## First evidence/answer decision",
             "",
-            "- Architecture: " + _cell(report.get("agent_architecture")),
-            "- Evidence status: " + _cell(report.get("agent_evidence_status")),
-            "- Stop reason: " + _cell(report.get("agent_stop_reason")),
-            "- Unresolved: " + (
-                ", ".join(str(x) for x in (report.get("agent_unresolved") or []))
+            "~~~json",
+            json.dumps(
+                report.get("first_answer_decision"),
+                ensure_ascii=False,
+                indent=2,
+                default=str,
+            ),
+            "~~~",
+        ]
+    )
+
+    if report.get("final_answer_decision"):
+        lines.extend(
+            [
+                "",
+                "## Final decision after targeted gap research",
+                "",
+                "~~~json",
+                json.dumps(
+                    report.get("final_answer_decision"),
+                    ensure_ascii=False,
+                    indent=2,
+                    default=str,
+                ),
+                "~~~",
+            ]
+        )
+
+    lines.extend(
+        [
+            "",
+            "## Task completion",
+            "",
+            "- Completed: "
+            + (
+                ", ".join(str(value) for value in report.get("completed_task_ids") or [])
+                or "none"
+            ),
+            "- Skipped by hard research budget: "
+            + (
+                ", ".join(str(value) for value in report.get("skipped_task_ids") or [])
                 or "none"
             ),
             "",
-        ])
-        for index, decision in enumerate(report.get("agent_decisions") or [], 1):
-            if not isinstance(decision, dict):
-                continue
-            lines.append(
-                str(index)
-                + ". "
-                + _cell(decision.get("action"))
-                + " - "
-                + _cell(decision.get("decision_summary"))
-            )
-        lines.append("")
-        lines.extend(["### Tool calls", ""])
-        for index, call in enumerate(report.get("tool_calls") or [], 1):
-            if not isinstance(call, dict):
-                continue
-            lines.append(
-                str(index)
-                + ". "
-                + _cell(call.get("tool"))
-                + " "
-                + _cell(call.get("arguments"))
-                + " ("
-                + _cell(call.get("elapsed_ms"))
-                + " ms)"
-            )
-        lines.append("")
-
-    lines.extend([
-        "## Evidence goals",
-        "",
-    ])
-
-    goals = report.get("evidence_goals") or []
-    if not goals:
-        lines.append("- No evidence goals stored.")
-    for goal in goals:
-        lines.extend([
-            "### " + _cell(goal.get("id")) + " - " + _cell(goal.get("kind")),
-            "- Need: " + _cell(goal.get("question")),
-            "- Coverage: " + _cell(goal.get("coverage_contract")),
-            "- Retrieval tools: " + (", ".join(str(x) for x in (goal.get("retrieval_tools") or [])) or "search"),
-            "- Search probes: " + (", ".join(str(x) for x in (goal.get("search_queries") or [])) or "none"),
+            "## AI-selected evidence",
             "",
-        ])
-
-    for title, key in (
-        ("Inferred / rephrased search questions", "inferred_or_rephrased_queries"),
-        ("Actually executed search queries", "executed_search_queries"),
-        ("Recovery search queries", "recovery_search_queries"),
-    ):
-        lines.extend(["## " + title, ""])
-        values = report.get(key) or []
-        if values:
-            lines.extend([str(index) + ". " + str(value) for index, value in enumerate(values, 1)])
-        else:
-            lines.append("- None stored.")
-        lines.append("")
-
-    lines.extend(["## Search results by executed query", ""])
-    per_query = report.get("per_query_search_results") or []
-    if not per_query:
-        lines.append("- No per-query previews were stored for this run.")
-        lines.append("")
-    for item in per_query:
-        lines.append("### [" + _cell(item.get("phase") or "initial") + "] " + _cell(item.get("query")))
-        meta = []
-        if item.get("goal_ids"):
-            meta.append("goals=" + ",".join(str(x) for x in item.get("goal_ids") or []))
-        if item.get("origins"):
-            meta.append("origins=" + ",".join(str(x) for x in item.get("origins") or []))
-        if meta:
-            lines.append("- " + "; ".join(meta))
-        for row in item.get("results") or []:
-            section = " > ".join(str(x) for x in (row.get("section_path") or []))
-            lines.append(
-                "- [" + _cell(row.get("source")) + "] "
-                + _cell(row.get("document_title"))
-                + " p." + _cell(row.get("page_from"))
-                + (" - " + _cell(section) if section else "")
-                + ": " + _cell((row.get("snippet") or "")[:500])
-            )
-        if not (item.get("results") or []):
-            lines.append("- No previewed candidates for this probe.")
-        lines.append("")
-
-    lines.extend([
-        "## Combined top search results",
-        "",
-        "| # | Lane | Document | Page | Section | Scores / sources | Snippet |",
-        "|---:|---|---|---:|---|---|---|",
-    ])
-    results = report.get("search_results") or []
-    for row in results[:80]:
-        page = row.get("page_from") if row.get("page_from") is not None else ""
-        section = " > ".join(str(x) for x in (row.get("section_path") or []))
-        score_bits = []
-        for name in ("rerank_score", "final_retrieval_score", "fused_score", "judge_score"):
-            if row.get(name) not in (None, ""):
-                score_bits.append(name + "=" + str(row.get(name)))
-        if row.get("sources"):
-            score_bits.append("sources=" + ",".join(str(x) for x in row.get("sources") or []))
+            "| # | Document | Page | Section | Chunk | Source text |",
+            "|---:|---|---:|---|---|---|",
+        ]
+    )
+    selected = report.get("selected_evidence") or []
+    if not selected:
+        lines.append("|  | No selected evidence |  |  |  |  |")
+    for row in selected:
+        section = " > ".join(str(value) for value in row.get("section_path") or [])
         lines.append(
-            "| " + _cell(row.get("debug_rank")) +
-            " | " + _cell(row.get("_trace_lane")) +
-            " | " + _cell(row.get("document_title") or row.get("document")) +
-            " | " + _cell(page) +
-            " | " + _cell(section or row.get("section")) +
-            " | " + _cell("; ".join(score_bits)) +
-            " | " + _cell((row.get("snippet") or row.get("text") or row.get("excerpt") or "")[:700]) + " |"
+            "| "
+            + _cell(row.get("rank"))
+            + " | "
+            + _cell(row.get("document_title"))
+            + " | "
+            + _cell(row.get("page_from"))
+            + " | "
+            + _cell(section)
+            + " | "
+            + _cell(row.get("chunk_id"))
+            + " | "
+            + _cell(row.get("snippet"))
+            + " |"
         )
-    if not results:
-        lines.append("|  |  | No stored candidate preview |  |  |  |  |")
 
-    lines.extend([
-        "",
-        "## Goal audit",
-        "",
-        "~~~json",
-        json.dumps(report.get("goal_satisfaction"), ensure_ascii=False, indent=2, default=str),
-        "~~~",
-        "",
-        "## Recovery / replanning",
-        "",
-        "~~~json",
-        json.dumps(report.get("recovery_summary"), ensure_ascii=False, indent=2, default=str),
-        "~~~",
-        "",
-        "## OKF / document routing",
-        "",
-        "~~~json",
-        json.dumps(report.get("okf_resolution"), ensure_ascii=False, indent=2, default=str),
-        "~~~",
-        "",
-        "## Corpus discovery",
-        "",
-        "~~~json",
-        json.dumps(report.get("corpus_discovery"), ensure_ascii=False, indent=2, default=str),
-        "~~~",
-        "",
-        "## Final answer",
-        "",
-        str(report.get("final_answer") or ""),
-        "",
-        "## Final citations",
-        "",
-        "~~~json",
-        json.dumps(report.get("citations"), ensure_ascii=False, indent=2, default=str),
-        "~~~",
-        "",
-        "## Notes",
-        "",
-    ])
+    lines.extend(
+        [
+            "",
+            "## Timings",
+            "",
+            "~~~json",
+            json.dumps(
+                report.get("workflow_timings_ms"),
+                ensure_ascii=False,
+                indent=2,
+                default=str,
+            ),
+            "~~~",
+            "",
+            "## Final answer",
+            "",
+            str(report.get("final_answer") or ""),
+            "",
+            "## Final citations",
+            "",
+            "~~~json",
+            json.dumps(
+                report.get("citations"),
+                ensure_ascii=False,
+                indent=2,
+                default=str,
+            ),
+            "~~~",
+            "",
+            "## Notes",
+            "",
+        ]
+    )
     lines.extend("- " + str(note) for note in report.get("notes") or [])
     return "\n".join(lines)

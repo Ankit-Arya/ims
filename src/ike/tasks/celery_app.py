@@ -5,7 +5,11 @@ from ike.core.config import get_settings
 settings = get_settings()
 visibility_timeout = settings.task_visibility_timeout_seconds
 
-celery_app = Celery("ike", broker=settings.redis_url, backend=settings.redis_url, include=["ike.tasks.jobs"])
+celery_app = Celery(
+    "ike",
+    broker=settings.redis_url,
+    backend=settings.redis_url,
+)
 celery_app.conf.update(
     task_serializer="json",
     result_serializer="json",
