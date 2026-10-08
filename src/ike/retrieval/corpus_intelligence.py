@@ -61,6 +61,61 @@ def _section_key(path: list[str]) -> str:
     return " > ".join(_clean(part).casefold() for part in path if _clean(part))
 
 
+def _document_metadata_match_score(query: str, document: Document) -> float:
+    """Score already-generated document metadata as a soft corpus-routing signal."""
+
+    metadata = dict(document.extra_metadata or {})
+    okf = dict(metadata.get("okf") or {})
+    profile = dict(metadata.get("operational_profile") or {})
+
+    values: list[str] = []
+    values.extend(str(value) for value in (okf.get("topic_terms") or []))
+    for name in (
+        "rolling_stock",
+        "primary_rolling_stock",
+        "line_codes",
+        "primary_line_codes",
+    ):
+        raw = profile.get(name) or []
+        if isinstance(raw, str):
+            raw = [raw]
+        values.extend(str(value) for value in raw)
+    if profile.get("document_type"):
+        values.append(str(profile["document_type"]))
+    if document.family_key:
+        values.append(str(document.family_key))
+    if document.source_role:
+        values.append(str(document.source_role))
+
+    metadata_text = " ".join(_clean(value) for value in values if _clean(value))
+    if not metadata_text:
+        return 0.0
+
+    query_tokens = {
+        token
+        for token in re.findall(r"[a-z0-9]+", query.casefold())
+        if len(token) >= 3
+    }
+    metadata_tokens = {
+        token
+        for token in re.findall(r"[a-z0-9]+", metadata_text.casefold())
+        if len(token) >= 3
+    }
+    if not query_tokens or not metadata_tokens:
+        return 0.0
+
+    score = len(query_tokens & metadata_tokens) / max(1, len(query_tokens))
+    compact_metadata = re.sub(r"[^a-z0-9]", "", metadata_text.casefold())
+    for identifier in re.findall(
+        r"\b[a-z]{1,10}[\s-]?\d{1,5}[a-z0-9/-]*\b",
+        query.casefold(),
+    ):
+        compact_identifier = re.sub(r"[^a-z0-9]", "", identifier)
+        if compact_identifier and compact_identifier in compact_metadata:
+            score += 1.0
+    return score
+
+
 def _high_signal_concepts(label: str, body: str, *, limit: int) -> list[str]:
     """Extract search aliases without creating standalone semantic vectors.
 
@@ -253,6 +308,31 @@ def build_nodes_for_document(db: Session, document_id: UUID, *, inference: Infer
 
     headings = [" > ".join(path) for path in paths.values() if path]
     doc_label = _clean(document.title or document.original_filename)
+    extra_metadata = dict(document.extra_metadata or {})
+    okf_metadata = dict(extra_metadata.get("okf") or {})
+    operational_profile = dict(extra_metadata.get("operational_profile") or {})
+
+    def profile_values(name: str, *, limit: int = 24) -> list[str]:
+        raw = operational_profile.get(name) or []
+        if isinstance(raw, str):
+            raw = [raw]
+        return [
+            _clean(str(value))
+            for value in raw
+            if _clean(str(value))
+        ][:limit]
+
+    okf_topic_terms = [
+        _clean(str(value))
+        for value in (okf_metadata.get("topic_terms") or [])
+        if _clean(str(value))
+    ][:80]
+    rolling_stock = profile_values("rolling_stock")
+    primary_rolling_stock = profile_values("primary_rolling_stock")
+    line_codes = profile_values("line_codes")
+    primary_line_codes = profile_values("primary_line_codes")
+    document_type = _clean(str(operational_profile.get("document_type") or ""))
+
     doc_text = "\n".join(
         filter(
             None,
@@ -262,6 +342,26 @@ def build_nodes_for_document(db: Session, document_id: UUID, *, inference: Infer
                 f"Family: {document.family_key or ''}",
                 f"Authority: {document.authority or ''}",
                 f"Revision: {document.revision or ''}",
+                (
+                    "OKF topics: " + " | ".join(okf_topic_terms)
+                    if okf_topic_terms
+                    else ""
+                ),
+                (
+                    "Rolling stock: "
+                    + " | ".join(
+                        dict.fromkeys(rolling_stock + primary_rolling_stock)
+                    )
+                    if rolling_stock or primary_rolling_stock
+                    else ""
+                ),
+                (
+                    "Line codes: "
+                    + " | ".join(dict.fromkeys(line_codes + primary_line_codes))
+                    if line_codes or primary_line_codes
+                    else ""
+                ),
+                f"Document type: {document_type}" if document_type else "",
                 "Sections: " + " | ".join(headings[:80]),
             ],
         )
@@ -561,6 +661,21 @@ class CorpusIntelligence:
                 .limit(self.settings.retrieval_intelligence_lexical_top_k)
             )
             lexical_rows = self.db.execute(lexical_stmt).all()
+
+            metadata_stmt = (
+                select(RetrievalNode, Document)
+                .join(Document, Document.id == RetrievalNode.document_id)
+                .where(*filters, RetrievalNode.node_type == "document")
+            )
+            metadata_rows = []
+            for node, document in self.db.execute(metadata_stmt).all():
+                metadata_score = _document_metadata_match_score(query, document)
+                if metadata_score > 0:
+                    metadata_rows.append((metadata_score, node, document))
+            metadata_rows.sort(key=lambda item: item[0], reverse=True)
+            metadata_rows = metadata_rows[
+                : self.settings.retrieval_intelligence_fused_top_k * 2
+            ]
         except ProgrammingError:
             self.db.rollback()
             return CorpusDiscovery(
@@ -591,6 +706,12 @@ class CorpusIntelligence:
             node, document = row[0], row[1]
             rows[node.id] = (node, document)
             scores[node.id] += 1.15 / (rrf_k + rank_index)
+        for rank_index, (_metadata_score, node, document) in enumerate(
+            metadata_rows,
+            start=1,
+        ):
+            rows[node.id] = (node, document)
+            scores[node.id] += 1.10 / (rrf_k + rank_index)
 
         ordered = sorted(scores, key=scores.get, reverse=True)[: self.settings.retrieval_intelligence_fused_top_k]
         hits: list[CorpusHit] = []

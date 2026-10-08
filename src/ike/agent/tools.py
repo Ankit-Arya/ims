@@ -170,17 +170,101 @@ class CorpusTools:
                 score += 10.0
         return score
 
+    @staticmethod
+    def _metadata_routing_hints(document: Document) -> dict:
+        metadata = dict(document.extra_metadata or {})
+        okf = dict(metadata.get("okf") or {})
+        profile = dict(metadata.get("operational_profile") or {})
+
+        def values(name: str, *, limit: int = 12) -> list[str]:
+            raw = profile.get(name) or []
+            if isinstance(raw, str):
+                raw = [raw]
+            return [
+                str(value).strip()
+                for value in raw
+                if str(value).strip()
+            ][:limit]
+
+        return {
+            "topic_terms": [
+                str(value).strip()
+                for value in (okf.get("topic_terms") or [])
+                if str(value).strip()
+            ][:20],
+            "rolling_stock": values("rolling_stock"),
+            "primary_rolling_stock": values("primary_rolling_stock"),
+            "line_codes": values("line_codes"),
+            "primary_line_codes": values("primary_line_codes"),
+            "document_type": str(profile.get("document_type") or "").strip(),
+        }
+
+    @classmethod
+    def _metadata_score(cls, query: str, document: Document) -> tuple[float, dict]:
+        hints = cls._metadata_routing_hints(document)
+        metadata_values: list[str] = []
+        for key in (
+            "topic_terms",
+            "rolling_stock",
+            "primary_rolling_stock",
+            "line_codes",
+            "primary_line_codes",
+        ):
+            metadata_values.extend(hints.get(key) or [])
+        if hints.get("document_type"):
+            metadata_values.append(str(hints["document_type"]))
+        if document.family_key:
+            metadata_values.append(str(document.family_key))
+        if document.source_role:
+            metadata_values.append(str(document.source_role))
+
+        metadata_text = " ".join(metadata_values).strip()
+        if not metadata_text:
+            return 0.0, hints
+
+        query_folded = query.casefold()
+        metadata_folded = metadata_text.casefold()
+        score = token_overlap(query, metadata_text) * 8.0
+
+        query_tokens = {
+            value
+            for value in re.findall(r"[a-z0-9]+", query_folded)
+            if len(value) >= 3
+        }
+        topic_tokens = {
+            str(value).casefold()
+            for value in (hints.get("topic_terms") or [])
+            if len(str(value).strip()) >= 3
+        }
+        score += min(15.0, 3.0 * len(query_tokens & topic_tokens))
+
+        compact_metadata = re.sub(r"[^a-z0-9]", "", metadata_folded)
+        identifiers = re.findall(
+            r"\b[a-z]{1,10}[\s-]?\d{1,5}[a-z0-9/-]*\b",
+            query_folded,
+        )
+        for identifier in identifiers:
+            compact_identifier = re.sub(r"[^a-z0-9]", "", identifier)
+            if compact_identifier and compact_identifier in compact_metadata:
+                score += 10.0
+
+        return score, hints
+
     def search_documents(self, query: str) -> ToolResult:
         started = time.perf_counter()
         query = " ".join(str(query or "").split())
         documents = {document.id: document for document in self._accessible_documents()}
         scores: dict[UUID, float] = {}
         matched_sections: dict[UUID, list[str]] = {}
+        metadata_hints: dict[UUID, dict] = {}
 
         for document in documents.values():
             title_score = self._title_score(query, document)
-            if title_score > 0:
-                scores[document.id] = title_score + min(
+            metadata_score, hints = self._metadata_score(query, document)
+            metadata_hints[document.id] = hints
+            base_score = title_score + metadata_score
+            if base_score > 0:
+                scores[document.id] = base_score + min(
                     3.5,
                     0.6 * math.log1p(max(0, int(document.page_count or 0))),
                 )
@@ -232,6 +316,7 @@ class CorpusTools:
                 "authority": document.authority,
                 "source_role": document.source_role,
                 "score": round(score, 6),
+                "metadata_hints": metadata_hints.get(document.id, {}),
                 "matched_sections": matched_sections.get(document.id, [])[:6],
             }
             for score, document in ranked[:limit]

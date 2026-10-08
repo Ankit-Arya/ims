@@ -47,7 +47,7 @@
           <div class="sidebar-label">Workspace</div>
           <nav class="app-nav" aria-label="Main navigation">
             <button data-tab="ask" class="nav-button active"><span class="nav-icon">⌕</span><span>Q&amp;A</span></button>
-            {% comment %} <button data-tab="realtime" class="nav-button"><span class="nav-icon">⚡</span><span>Real-Time IMS</span></button> {% endcomment %}
+            {# <button data-tab="realtime" class="nav-button"><span class="nav-icon">⚡</span><span>Real-Time IMS</span></button> #}
             <button data-tab="history" class="nav-button"><span class="nav-icon">◷</span><span>My Questions</span></button>
             <button data-tab="documents" class="nav-button"><span class="nav-icon">▤</span><span>Knowledge</span></button>
             <button data-tab="library" class="nav-button"><span class="nav-icon">▣</span><span>My PDFs</span></button>
@@ -59,9 +59,9 @@
             <label class="sidebar-control" for="queryMode">
               <span>Mode</span>
               <select id="queryMode" aria-label="Answer mode">
-                {% comment %} <option value="direct">Quick Answer</option> {% endcomment %}
+                {# <option value="direct">Quick Answer</option> #}
                 <option value="research" selected>Comprehensive</option>
-                {% comment %} <option value="deep">Deep Analysis</option> {% endcomment %}
+                {# <option value="deep">Deep Analysis</option> #}
               </select>
             </label>
             <p id="modeHint" class="sidebar-hint">Broad evidence search, coverage checks and verification.</p>
@@ -92,7 +92,7 @@
           <button id="activitySidebarBtn" class="sidebar-action sidebar-activity" type="button"><span>Activity &amp; recent</span><span>›</span></button>
           <div class="sidebar-note">
             <strong>Ask naturally</strong>
-            {% comment %} <span>You do not need exact manual terminology. IMS preserves your wording, expands supported terminology and adds useful related context from authorised sources.</span> {% endcomment %}
+            {# <span>You do not need exact manual terminology. IMS preserves your wording, expands supported terminology and adds useful related context from authorised sources.</span> #}
           </div>
         </aside>
 
@@ -103,7 +103,7 @@
                 <div>
                   <span class="eyebrow">Document intelligence</span>
                   <h1>Ask IMS</h1>
-                  {% comment %} <p>Search your authorised knowledge and personal PDFs. Each question is interpreted independently; prior questions never silently constrain the next search.</p> {% endcomment %}
+                  {# <p>Search your authorised knowledge and personal PDFs. Each question is interpreted independently; prior questions never silently constrain the next search.</p> #}
                 </div>
               </div>
 
@@ -113,7 +113,7 @@
                   <div class="empty-answer">
                     <span class="empty-mark">⌕</span>
                     <h2>Ask across your documents</h2>
-                    {% comment %} <p>Ask in your own words. IMS will preserve literal terms, expand supported terminology and surface materially relevant context from your authorised PDFs.</p> {% endcomment %}
+                    {# <p>Ask in your own words. IMS will preserve literal terms, expand supported terminology and surface materially relevant context from your authorised PDFs.</p> #}
                   </div>
                 </section>
               </div>
@@ -125,7 +125,7 @@
                     <button id="askBtn" class="primary ask-button" type="button"><span id="askBtnLabel">Ask</span><span class="send-glyph">↑</span></button>
                   </div>
                   <div class="composer-foot">
-                    {% comment %} <span class="subtle">Answers stay grounded in authorised PDFs and may include useful related conditions, exceptions and scenarios.</span> {% endcomment %}
+                    {# <span class="subtle">Answers stay grounded in authorised PDFs and may include useful related conditions, exceptions and scenarios.</span> #}
                     <span class="keyboard-hint">Enter to send · Shift+Enter for a new line</span>
                   </div>
                   <div id="queryStatus" class="status-message error"></div>

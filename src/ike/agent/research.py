@@ -246,7 +246,12 @@ class ResearchExecutor:
 
         routed_document_ids: list[str] = []
         if task.source_query:
-            routing = self.tools.search_documents(task.source_query)
+            routing_query = " ".join(
+                value
+                for value in (task.source_query, task.query)
+                if value and value.strip()
+            )
+            routing = self.tools.search_documents(routing_query)
             self._record(task=task, result=routing, round_name=round_name)
             for item in routing.items:
                 document_id = item.get("document_id")
