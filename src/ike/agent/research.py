@@ -110,6 +110,86 @@ class ResearchBundle:
             )
         return rows
 
+    def evidence_selection_rows(
+        self,
+        *,
+        max_items: int,
+        excerpt_chars: int,
+    ) -> list[dict]:
+        rows = self.evidence_rows(max_items=max_items)
+        compact: list[dict] = []
+        for row in rows:
+            candidate = self.candidate_store.get(str(row["chunk_id"]))
+            if candidate is None:
+                continue
+            compact.append(
+                {
+                    **row,
+                    "text": str(row.get("text") or "")[:excerpt_chars],
+                    "score": round(
+                        float(
+                            candidate.final_retrieval_score
+                            or candidate.rerank_score
+                            or candidate.fused_score
+                            or 0.0
+                        ),
+                        6,
+                    ),
+                    "direct_score": round(
+                        float(
+                            candidate.judge_details.get(
+                                "direct_evidence_score",
+                                0.0,
+                            )
+                            or 0.0
+                        ),
+                        6,
+                    ),
+                    "coverage_groups": list(
+                        candidate.judge_details.get("coverage_groups", []) or []
+                    ),
+                    "family_key": candidate.family_key,
+                    "document_profile": dict(candidate.document_profile or {}),
+                }
+            )
+        return compact
+
+    def evidence_rows_for_ids(
+        self,
+        evidence_ids: list[str],
+        *,
+        max_items: int,
+        reserve_items: int = 0,
+    ) -> list[dict]:
+        requested = [
+            str(value)
+            for value in evidence_ids
+            if str(value)
+        ]
+        requested_set = set(requested)
+        by_id = {
+            row["evidence_id"]: row
+            for row in self.evidence_rows(
+                max_items=max(max_items, len(self.evidence_order))
+            )
+        }
+        selected = [
+            by_id[evidence_id]
+            for evidence_id in requested
+            if evidence_id in by_id
+        ]
+        if reserve_items > 0 and len(selected) < max_items:
+            for row in by_id.values():
+                if row["evidence_id"] in requested_set:
+                    continue
+                selected.append(row)
+                if (
+                    len(selected) >= max_items
+                    or len(selected) >= len(requested) + reserve_items
+                ):
+                    break
+        return selected[:max_items]
+
     def answer_observations(
         self,
         *,
@@ -243,9 +323,53 @@ class ResearchExecutor:
         ):
             return
 
+        context_candidates = list(result.candidates[: task.context_hits])
+        if task.kind == "enumerate" and task.coverage_facets:
+            coverage = dict(result.metadata.get("coverage_balance") or {})
+            groups = [
+                str(value)
+                for value in (coverage.get("groups") or [])
+                if str(value)
+            ][
+                : self.tools.settings.agent_enumeration_context_group_limit
+            ]
+            target_hits = max(task.context_hits, len(groups))
+            selected: list[Candidate] = []
+            selected_chunks: set[str] = set()
+
+            for group in groups:
+                for candidate in result.candidates:
+                    chunk_id = str(candidate.chunk_id)
+                    candidate_groups = set(
+                        str(value)
+                        for value in (
+                            candidate.judge_details.get("coverage_groups", [])
+                            or []
+                        )
+                    )
+                    if (
+                        chunk_id in selected_chunks
+                        or group not in candidate_groups
+                    ):
+                        continue
+                    selected.append(candidate)
+                    selected_chunks.add(chunk_id)
+                    break
+
+            for candidate in result.candidates:
+                if len(selected) >= target_hits:
+                    break
+                chunk_id = str(candidate.chunk_id)
+                if chunk_id in selected_chunks:
+                    continue
+                selected.append(candidate)
+                selected_chunks.add(chunk_id)
+
+            context_candidates = selected[:target_hits]
+
         seen_chunks: set[str] = set()
         for index, candidate in enumerate(
-            result.candidates[: task.context_hits],
+            context_candidates,
             start=1,
         ):
             chunk_id = str(candidate.chunk_id)
@@ -280,7 +404,16 @@ class ResearchExecutor:
         self._checkpoint()
 
         if task.kind == "source_lookup":
-            result = self.tools.search_documents(task.source_query or task.query)
+            routing_query = " ".join(
+                value
+                for value in (
+                    task.source_query,
+                    task.query,
+                    *task.query_variants,
+                )
+                if value and value.strip()
+            )
+            result = self.tools.search_documents(routing_query)
             self._record(task=task, result=result, round_name=round_name)
             return
 
@@ -288,7 +421,11 @@ class ResearchExecutor:
         if task.source_query:
             routing_query = " ".join(
                 value
-                for value in (task.source_query, task.query)
+                for value in (
+                    task.source_query,
+                    task.query,
+                    *task.query_variants,
+                )
                 if value and value.strip()
             )
             routing = self.tools.search_documents(routing_query)
@@ -307,6 +444,7 @@ class ResearchExecutor:
             result = self.tools.search(
                 task.query,
                 mode=task.search_mode,
+                query_variants=task.query_variants,
                 exact_terms=task.exact_terms,
                 document_ids=hard_document_ids,
                 boost_document_ids=boost_document_ids,
@@ -320,9 +458,11 @@ class ResearchExecutor:
             result = self.tools.enumerate(
                 task.query,
                 mode=task.search_mode,
+                query_variants=task.query_variants,
                 exact_terms=task.exact_terms,
                 document_ids=hard_document_ids,
                 boost_document_ids=boost_document_ids,
+                coverage_facets=task.coverage_facets,
                 top_k=task.top_k,
             )
             self._record(task=task, result=result, round_name=round_name)

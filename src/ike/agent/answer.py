@@ -6,6 +6,7 @@ from pydantic import BaseModel
 
 from ike.agent.models import (
     AnswerDecision,
+    EvidenceSelectionDecision,
     FinalAnswerDecision,
     ResearchPlan,
 )
@@ -133,6 +134,7 @@ class EvidenceAnswerAgent:
         recent_history: list[dict],
         plan: ResearchPlan,
         bundle: ResearchBundle,
+        evidence_selection: EvidenceSelectionDecision | None,
         allow_gap: bool,
         schema_model: type[DecisionT],
     ) -> tuple[DecisionT, int, int]:
@@ -150,6 +152,15 @@ class EvidenceAnswerAgent:
                 max(18, 12 * max(1, len(plan.answer_requirements))),
             )
 
+        if evidence_selection and evidence_selection.selected_evidence_ids:
+            evidence_rows = bundle.evidence_rows_for_ids(
+                evidence_selection.selected_evidence_ids,
+                max_items=evidence_limit,
+                reserve_items=self.settings.agent_evidence_selector_reserve,
+            )
+        else:
+            evidence_rows = bundle.evidence_rows(max_items=evidence_limit)
+
         for _attempt in range(2):
             user_prompt = answer_user_prompt(
                 question=question,
@@ -157,7 +168,12 @@ class EvidenceAnswerAgent:
                 recent_history=recent_history,
                 plan=plan.model_dump(),
                 observations=bundle.answer_observations(),
-                evidence=bundle.evidence_rows(max_items=evidence_limit),
+                evidence_selection=(
+                    evidence_selection.model_dump()
+                    if evidence_selection is not None
+                    else None
+                ),
+                evidence=evidence_rows,
             )
             if feedback:
                 user_prompt += (
@@ -199,6 +215,7 @@ class EvidenceAnswerAgent:
         recent_history: list[dict],
         plan: ResearchPlan,
         bundle: ResearchBundle,
+        evidence_selection: EvidenceSelectionDecision | None = None,
     ) -> tuple[AnswerDecision, int, int]:
         return self._generate_checked(
             question=question,
@@ -206,6 +223,7 @@ class EvidenceAnswerAgent:
             recent_history=recent_history,
             plan=plan,
             bundle=bundle,
+            evidence_selection=evidence_selection,
             allow_gap=True,
             schema_model=AnswerDecision,
         )
@@ -218,6 +236,7 @@ class EvidenceAnswerAgent:
         recent_history: list[dict],
         plan: ResearchPlan,
         bundle: ResearchBundle,
+        evidence_selection: EvidenceSelectionDecision | None = None,
     ) -> tuple[FinalAnswerDecision, int, int]:
         return self._generate_checked(
             question=question,
@@ -225,6 +244,7 @@ class EvidenceAnswerAgent:
             recent_history=recent_history,
             plan=plan,
             bundle=bundle,
+            evidence_selection=evidence_selection,
             allow_gap=False,
             schema_model=FinalAnswerDecision,
         )

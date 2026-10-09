@@ -17,17 +17,25 @@ def planner_system_prompt() -> str:
         "has four independent enumeration requirements and should normally have separate "
         "research tasks. Correlated facts may share a task only when the same source passage "
         "is genuinely likely to answer them together.\n\n"
-        "Understand shorthand, acronyms, typos, layman language, implied conditions, "
-        "multi-part questions and hypothetical operational scenarios. Use depends_on only "
-        "when one research need logically depends on another. If the downstream search cannot "
-        "be formulated until evidence is seen, leave it for the evidence agent's targeted "
-        "gap round.\n\n"
+        "Understand shorthand, acronyms, likely typos, layman language, relation direction "
+        "(for example finding a person from a role versus finding a role from a person), implied "
+        "conditions, multi-part questions and hypothetical operational scenarios. Preserve the "
+        "user's literal anchors while also adding source-language variants that may appear in "
+        "documents. Do not over-commit to one interpretation when a nearby plausible reading can "
+        "be cheaply searched as an alternative. Use depends_on only when one research need "
+        "logically depends on another. If the downstream search cannot be formulated until "
+        "evidence is seen, leave it for the evidence agent's targeted gap round.\n\n"
         "Choose the retrieval operation intentionally:\n"
         "- search: focused factual/procedural retrieval.\n"
         "- enumerate: exhaustive/list-style retrieval when the user asks for all, complete, "
-        "every, list, categories, members, locations, signals, chapters, duties, conditions, "
+        "every, each, list, categories, members, locations, signals, chapters, duties, conditions, "
         "or another bounded set that may be distributed across the corpus. Do not use a normal "
-        "top-ranked search for a request that explicitly requires completeness.\n"
+        "top-ranked search for a request that explicitly requires completeness. For an enumerate "
+        "task, set coverage_facets when completeness must be balanced across known generic corpus "
+        "dimensions: rolling_stock, line_code, document_family, document_type, or document. "
+        "Use the smallest relevant facet set; leave it empty when no such partition is implied. "
+        "Do not put one arbitrary member/subtype into exact_terms for an all/every/each request "
+        "unless the user explicitly named that member.\n"
         "- source_lookup: find likely governing documents/manuals when the source is named or "
         "when routing to the correct policy/manual materially improves precision. Source lookup "
         "is a soft retrieval prior unless the user explicitly selected a document; it must not "
@@ -35,11 +43,17 @@ def planner_system_prompt() -> str:
         "- structure: inspect raw document hierarchy when a document_id is already known.\n"
         "- context: inspect surrounding chunks when a chunk_id is already known.\n\n"
         "Each search/enumerate query should target one coherent information need rather than "
-        "copying the user's whole sentence. Use lexical for exact identifiers/phrases, semantic "
-        "for conceptual paraphrases, and hybrid when both are useful. Preserve technical "
+        "copying the user's whole sentence. Use query_variants (normally 0-3, maximum 4) for "
+        "plausible alternate lexical phrasings such as abbreviation expansion, source-header "
+        "wording, inverse relation wording, or a likely typo correction. Variants must remain "
+        "faithful to the user's intent and must not guess the answer. Use lexical for exact "
+        "identifiers/phrases, semantic for conceptual paraphrases, and hybrid when both are useful. Preserve technical "
         "identifiers/acronyms in exact_terms. For terse fact/table lookups, include a small "
         "set of likely literal source-label or synonym variants when the user's wording may differ "
-        "from the document wording; preserve the user's original terms as well. exact_terms may "
+        "from the document wording; preserve the user's original terms as well. When a plausible "
+        "typo materially changes meaning, include both the literal reading and the likely corrected "
+        "reading in query/query_variants so retrieval can resolve it from evidence rather than "
+        "silently committing to one interpretation. exact_terms may "
         "contain up to eight distinct literal phrases; never squeeze multiple quoted terms into "
         "one string.\n\n"
         "If a procedure, table, entitlement schedule or list is likely to continue across "
@@ -48,10 +62,13 @@ def planner_system_prompt() -> str:
         "is executed exactly as you specify; use it when completeness depends on adjacent rows "
         "or procedural steps.\n\n"
         "Recent query history is supplied separately. Use it only when the current user request "
-        "refers to prior queries/answers (for example 'summarise my last two queries', 'what "
-        "about the previous one?', 'as I asked earlier'). Do not let unrelated history distort "
-        "a new standalone question. For a history-only/meta request, set needs_corpus=false and "
-        "tasks=[]; the answer agent can answer from recent history.\n\n"
+        "explicitly refers to prior queries/answers through a pronoun/deictic reference or wording "
+        "such as 'previous', 'same', 'that one', 'what about it?', or 'as I asked earlier'. A short "
+        "or ambiguous standalone query is NOT enough reason to inherit the previous entity. If the "
+        "current wording names a broader category than a prior query, never silently narrow it to "
+        "the prior subtype unless the user explicitly says to use the same subtype. Do not let "
+        "unrelated history distort a new standalone question. For a history-only/meta request, "
+        "set needs_corpus=false and tasks=[]; the answer agent can answer from recent history.\n\n"
         "If the user explicitly names a manual, rulebook, circular or handbook, create a "
         "source_lookup task unless a valid document_id is already supplied. source_lookup is "
         "routing evidence only, not factual answer evidence, so factual requirements must also "
@@ -86,6 +103,45 @@ def planner_user_prompt(
     )
 
 
+def evidence_selector_system_prompt() -> str:
+    return (
+        "You are a fast evidence-selection controller for an internal-document RAG system. "
+        "Do not answer the user's question. Inspect the retrieved evidence candidates and select "
+        "the smallest high-quality set that gives the strong answer model the best chance of a "
+        "complete, source-faithful answer.\n\n"
+        "Assess every planned requirement. Prefer direct passages over documents that merely "
+        "mention the topic. Prefer primary/named sources for source-specific questions. Preserve "
+        "important disagreements, exceptions and revision-specific differences instead of hiding "
+        "them. For procedures, keep contiguous/continuation evidence when steps span chunks. For "
+        "tables/lists, keep the rows/sections that actually contain requested values.\n\n"
+        "For exhaustive/all/every/each questions, coverage diversity is mandatory: inspect "
+        "coverage_groups and document_profile, and select useful evidence across distinct groups "
+        "instead of selecting many near-duplicate chunks from the easiest group. A requirement is "
+        "covered only when the candidate set supports the requested breadth and substance; mark "
+        "partial/missing otherwise.\n\n"
+        "Retrieval score is a hint, not truth. A lower-ranked chunk with exact factual/procedural "
+        "content may be better than a high-ranked descriptive comparison. Avoid redundant copies "
+        "unless they materially improve authority, completeness or resolve a conflict. "
+        "selected_evidence_ids must be drawn only from supplied E# IDs."
+    )
+
+
+def evidence_selector_user_prompt(
+    *,
+    question: str,
+    plan: dict,
+    evidence: list[dict],
+) -> str:
+    return (
+        f"User question:\n{question}\n\n"
+        f"Research plan:\n{json.dumps(plan, ensure_ascii=False, indent=2)}\n\n"
+        f"Retrieved evidence candidates (compact excerpts):\n"
+        f"{json.dumps(evidence, ensure_ascii=False, indent=2)}\n\n"
+        "Select evidence for every requirement, record which coverage groups are represented, "
+        "and identify only genuine remaining evidence gaps. Do not draft the final answer."
+    )
+
+
 def answer_system_prompt(*, allow_gap: bool) -> str:
     gap_rule = (
         "If ANY mandatory answer requirement is missing or only partially supported, return "
@@ -100,8 +156,10 @@ def answer_system_prompt(*, allow_gap: bool) -> str:
         "document_id only when the routing observation/matched section establishes that the "
         "candidate contains the requested procedure or table; otherwise leave document_id "
         "empty so source hints remain soft and global chunk retrieval can still recover stronger "
-        "evidence outside the likely governing documents. Do not waste the gap round re-running "
-        "an equivalent global query."
+        "evidence outside the likely governing documents. For incomplete exhaustive/multi-group "
+        "requirements, prefer several narrow gap tasks for the genuinely missing groups/facets "
+        "over one giant repeated global query; preserve appropriate coverage_facets on enumerate "
+        "tasks. Do not waste the gap round re-running an equivalent global query."
         if allow_gap
         else
         "No further research round is available. Return the strongest grounded final answer. "
@@ -112,6 +170,10 @@ def answer_system_prompt(*, allow_gap: bool) -> str:
         "You are the evidence-reasoning and answer agent for a safety-critical internal "
         "knowledge system. You receive the original question, recent conversational context, "
         "the AI research plan, retrieval observations and documentary evidence chunks.\n\n"
+        "An upstream fast AI evidence selector may be supplied. Treat its shortlist and coverage "
+        "assessment as advisory semantic triage, not as truth: independently verify the selected "
+        "chunks, use the small reserve evidence when it is better, and request precise gap research "
+        "when the selector correctly exposes missing coverage.\n\n"
         "Coverage discipline: produce one requirement_assessment for EVERY requirement in the "
         "plan, using its exact requirement_id. Mark supported only when the supplied evidence "
         "(or recent history for a history-only request) actually answers it. Mark partial when "
@@ -124,7 +186,11 @@ def answer_system_prompt(*, allow_gap: bool) -> str:
         "differences rather than mixing them.\n\n"
         "For exhaustive/list questions, completeness matters: do not transform a ranked sample "
         "into language such as 'all' or 'complete'. If the plan requires a complete bounded set "
-        "and evidence appears partial, request enumerate or source/structure evidence.\n\n"
+        "and evidence appears partial, request enumerate or source/structure evidence. A retrieval "
+        "miss is not proof of corpus absence: never say that information or a source does not exist "
+        "in the corpus merely because the current top-K did not contain it. Such absence claims "
+        "require explicit source/structure/exhaustive evidence; otherwise state only the specific "
+        "point that remains unresolved after the allowed gap search.\n\n"
         "For procedures, thresholds, entitlements and tables, inspect all supplied neighboring "
         "context. A single threshold row is not a complete operational answer when surrounding "
         "source text contains actions, exceptions, restoration steps, documents, rates or "
@@ -139,7 +205,12 @@ def answer_system_prompt(*, allow_gap: bool) -> str:
         "a gap round is available, target that identified document before concluding absence.\n\n"
         f"{gap_rule}\n\n"
         "When status=answer, write the actual final response in answer. It should be direct, "
-        "useful and complete for the supported requirements. Cite documentary factual claims "
+        "professional, useful and complete for the supported requirements. Lead with the supported "
+        "answer rather than a generic caveat. For multi-group/comparative requests, organize the "
+        "answer cleanly by the user's natural groups and keep each group's procedure/facts separate. "
+        "If a specific point genuinely remains unresolved after the allowed research, place that "
+        "precise limitation after the supported material rather than making the whole response "
+        "sound negative. Cite documentary factual claims "
         "with [E#] and list those IDs in selected_evidence_ids. History-only/meta answers do "
         "not require documentary citations. Do not expose retrieval internals.\n\n"
         "Do not append generic uncertainty boilerplate. Never use the phrase 'not yet verified "
@@ -155,6 +226,7 @@ def answer_user_prompt(
     recent_history: list[dict],
     plan: dict,
     observations: list[dict],
+    evidence_selection: dict | None,
     evidence: list[dict],
 ) -> str:
     return (
@@ -166,7 +238,9 @@ def answer_user_prompt(
         f"Research plan:\n{json.dumps(plan, ensure_ascii=False, indent=2)}\n\n"
         f"Research observations:\n"
         f"{json.dumps(observations, ensure_ascii=False, indent=2)}\n\n"
-        f"Documentary evidence candidates:\n"
+        f"Fast AI evidence-selection assessment (advisory):\n"
+        f"{json.dumps(evidence_selection or {}, ensure_ascii=False, indent=2)}\n\n"
+        f"Documentary evidence candidates supplied for strong reasoning:\n"
         f"{json.dumps(evidence, ensure_ascii=False, indent=2)}\n\n"
         "Assess every planned requirement before deciding whether to answer or request the "
         "single targeted evidence round."

@@ -66,9 +66,17 @@ class Settings(BaseSettings):
     agent_enumeration_prefilter_k: int = 96
     agent_enumeration_dense_top_k: int = 32
     agent_enumeration_rerank_candidates: int = 80
+    agent_enumeration_context_group_limit: int = 8
     agent_document_search_limit: int = 12
     agent_structure_max_nodes: int = 180
     agent_evidence_catalog_limit: int = 120
+    agent_evidence_selector_enabled: bool = True
+    agent_evidence_selector_min_candidates: int = 8
+    agent_evidence_selector_max_candidates: int = 48
+    agent_evidence_selector_excerpt_chars: int = 1200
+    agent_evidence_selector_reserve: int = 4
+    agent_evidence_selector_max_output_tokens: int = 1600
+    agent_evidence_selector_reasoning: Literal["low", "medium", "high"] = "low"
     agent_answer_evidence_cap: int = 48
     agent_selected_evidence_cap: int = 24
     agent_max_evidence: int = 50

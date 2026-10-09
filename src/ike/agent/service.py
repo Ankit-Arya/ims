@@ -8,6 +8,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from ike.agent.answer import EvidenceAnswerAgent
+from ike.agent.evidence_selector import EvidenceSelectionAgent
 from ike.agent.query_intelligence import QueryIntelligenceAgent
 from ike.agent.research import ResearchBundle, ResearchExecutor
 from ike.core.config import get_settings
@@ -164,6 +165,8 @@ class AgenticQAService:
             "planner_reasoning": self.settings.agent_planner_reasoning,
             "answer_model": self.settings.llm_strong_model,
             "answer_reasoning": self.settings.agent_answer_reasoning,
+            "evidence_selector_model": self.settings.llm_fast_model,
+            "evidence_selector_reasoning": self.settings.agent_evidence_selector_reasoning,
             "recent_context_query_ids": [
                 item["query_id"] for item in recent_history
             ],
@@ -234,6 +237,34 @@ class AgenticQAService:
         else:
             timings["primary_research"] = 0
 
+        primary_evidence_selection = None
+        timings["evidence_selection"] = 0
+        if plan.needs_corpus:
+            selector_started = time.perf_counter()
+            try:
+                selector = EvidenceSelectionAgent(self.llm)
+                (
+                    primary_evidence_selection,
+                    selector_in_tokens,
+                    selector_out_tokens,
+                ) = selector.select(
+                    question=question,
+                    plan=plan,
+                    bundle=bundle,
+                )
+                input_tokens += selector_in_tokens
+                output_tokens += selector_out_tokens
+                if primary_evidence_selection is not None:
+                    trace["primary_evidence_selection"] = (
+                        primary_evidence_selection.model_dump()
+                    )
+            except Exception as exc:
+                trace["primary_evidence_selection_error"] = type(exc).__name__
+                primary_evidence_selection = None
+            timings["evidence_selection"] = int(
+                (time.perf_counter() - selector_started) * 1000
+            )
+
         self._checkpoint()
         self._emit(
             "reasoning",
@@ -251,6 +282,7 @@ class AgenticQAService:
                 recent_history=recent_history,
                 plan=plan,
                 bundle=bundle,
+                evidence_selection=primary_evidence_selection,
             )
         except Exception:
             trace.update(
@@ -280,6 +312,7 @@ class AgenticQAService:
         final_answer = decision.answer
         selected_ids = decision.selected_evidence_ids
         confidence = decision.confidence
+        final_requirement_assessments = decision.requirement_assessments
 
         if decision.status == "needs_evidence":
             gap_tasks = decision.gap_tasks[: self.settings.agent_max_gap_tasks]
@@ -303,6 +336,32 @@ class AgenticQAService:
                 (time.perf_counter() - gap_started) * 1000
             )
 
+            gap_evidence_selection = primary_evidence_selection
+            gap_selector_started = time.perf_counter()
+            try:
+                selector = EvidenceSelectionAgent(self.llm)
+                (
+                    refreshed_selection,
+                    selector_in_tokens,
+                    selector_out_tokens,
+                ) = selector.select(
+                    question=question,
+                    plan=plan,
+                    bundle=bundle,
+                )
+                input_tokens += selector_in_tokens
+                output_tokens += selector_out_tokens
+                if refreshed_selection is not None:
+                    gap_evidence_selection = refreshed_selection
+                    trace["gap_evidence_selection"] = (
+                        refreshed_selection.model_dump()
+                    )
+            except Exception as exc:
+                trace["gap_evidence_selection_error"] = type(exc).__name__
+            timings["gap_evidence_selection"] = int(
+                (time.perf_counter() - gap_selector_started) * 1000
+            )
+
             self._checkpoint()
             final_started = time.perf_counter()
             try:
@@ -312,6 +371,7 @@ class AgenticQAService:
                     recent_history=recent_history,
                     plan=plan,
                     bundle=bundle,
+                    evidence_selection=gap_evidence_selection,
                 )
             except Exception:
                 trace.update(
@@ -340,6 +400,7 @@ class AgenticQAService:
             final_answer = final_decision.answer
             selected_ids = final_decision.selected_evidence_ids
             confidence = final_decision.confidence
+            final_requirement_assessments = final_decision.requirement_assessments
 
         evidence = self._selected_evidence(
             bundle,
@@ -353,6 +414,12 @@ class AgenticQAService:
         cited_ids = [item.evidence_id for item in evidence]
         if final_answer and not evidence and plan.needs_corpus:
             confidence = "low"
+
+        requirements_supported = bool(final_requirement_assessments) and all(
+            assessment.status == "supported"
+            for assessment in final_requirement_assessments
+        )
+        corpus_verified = bool(evidence) and requirements_supported
 
         elapsed_ms = int((time.perf_counter() - started) * 1000)
         timings["agent_total"] = elapsed_ms
@@ -370,7 +437,7 @@ class AgenticQAService:
                     "conversation_context"
                     if not plan.needs_corpus
                     else "sufficient"
-                    if evidence and confidence in {"high", "medium"}
+                    if corpus_verified
                     else "partial"
                 ),
                 "agent_stop_reason": (
@@ -401,7 +468,7 @@ class AgenticQAService:
             "retrieval_trace": trace,
             "input_tokens": input_tokens,
             "output_tokens": output_tokens,
-            "verified": bool(evidence) or not plan.needs_corpus,
+            "verified": (not plan.needs_corpus) or corpus_verified,
             "workflow_timings_ms": timings,
             "recovery_attempted": decision.status == "needs_evidence",
             "query_plan": plan.model_dump(),

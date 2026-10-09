@@ -131,6 +131,9 @@ class CorpusTools:
                 float(candidate.judge_details.get("direct_evidence_score", 0.0) or 0.0),
                 6,
             ),
+            "coverage_groups": list(
+                candidate.judge_details.get("coverage_groups", []) or []
+            ),
             "snippet": " ".join(
                 (candidate.text or candidate.contextual_text or "").split()
             )[:1800],
@@ -148,6 +151,26 @@ class CorpusTools:
             existing.final_retrieval_score,
             candidate.final_retrieval_score,
         )
+
+    @staticmethod
+    def _clean_query_variants(
+        query: str,
+        variants: list[str] | None,
+        *,
+        max_items: int = 4,
+    ) -> list[str]:
+        cleaned: list[str] = []
+        seen = {query.casefold().strip()} if query else set()
+        for raw in variants or []:
+            value = " ".join(str(raw or "").split())
+            key = value.casefold()
+            if not value or key in seen:
+                continue
+            seen.add(key)
+            cleaned.append(value)
+            if len(cleaned) >= max_items:
+                break
+        return cleaned
 
     @staticmethod
     def _rerank_text(candidate: Candidate) -> str:
@@ -341,6 +364,132 @@ class CorpusTools:
             )
         )
         return [candidate.chunk_id for candidate in boosted]
+
+    @staticmethod
+    def _coverage_values(candidate: Candidate, facet: str) -> list[str]:
+        profile = candidate.document_profile or {}
+        values: list[str] = []
+
+        def as_values(raw) -> list:
+            if raw in (None, ""):
+                return []
+            if isinstance(raw, (list, tuple, set)):
+                return list(raw)
+            return [raw]
+
+        if facet == "rolling_stock":
+            raw_values = (
+                as_values(profile.get("primary_rolling_stock"))
+                + as_values(profile.get("rolling_stock"))
+            )
+            values = [str(value).strip() for value in raw_values if str(value).strip()]
+        elif facet == "line_code":
+            raw_values = (
+                as_values(profile.get("primary_line_codes"))
+                + as_values(profile.get("line_codes"))
+            )
+            values = [str(value).strip() for value in raw_values if str(value).strip()]
+        elif facet == "document_family":
+            if candidate.family_key:
+                values = [str(candidate.family_key).strip()]
+        elif facet == "document_type":
+            value = str(profile.get("document_type") or "").strip()
+            if value and value.casefold() not in {"unknown", "unspecified", "other"}:
+                values = [value]
+        elif facet == "document":
+            values = [str(candidate.document_id)]
+
+        deduped: list[str] = []
+        seen: set[str] = set()
+        for value in values:
+            key = value.casefold()
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            deduped.append(value)
+        return deduped
+
+    @classmethod
+    def _balance_enumeration_coverage(
+        cls,
+        ranked: list[Candidate],
+        *,
+        coverage_facets: list[str] | None,
+        top_k: int,
+    ) -> tuple[list[Candidate], dict]:
+        facets = [str(value) for value in (coverage_facets or []) if str(value)]
+        if not facets or not ranked:
+            return ranked[:top_k], {
+                "enabled": False,
+                "facets": facets,
+                "groups": [],
+            }
+
+        buckets: dict[str, list[Candidate]] = {}
+        first_rank: dict[str, int] = {}
+        for rank, candidate in enumerate(ranked):
+            candidate_groups: list[str] = []
+            for facet in facets:
+                for value in cls._coverage_values(candidate, facet):
+                    group = f"{facet}:{value}"
+                    candidate_groups.append(group)
+                    buckets.setdefault(group, []).append(candidate)
+                    first_rank[group] = min(rank, first_rank.get(group, rank))
+            if not candidate_groups:
+                group = "unclassified"
+                candidate_groups = [group]
+                buckets.setdefault(group, []).append(candidate)
+                first_rank[group] = min(rank, first_rank.get(group, rank))
+            candidate.judge_details["coverage_groups"] = candidate_groups
+
+        ordered_groups = sorted(
+            buckets,
+            key=lambda group: (first_rank.get(group, 10**9), group.casefold()),
+        )
+        if len(ordered_groups) > top_k:
+            ordered_groups = ordered_groups[:top_k]
+
+        positions = {group: 0 for group in ordered_groups}
+        selected: list[Candidate] = []
+        seen_chunks: set[UUID] = set()
+        while ordered_groups and len(selected) < top_k:
+            progressed = False
+            for group in ordered_groups:
+                bucket = buckets[group]
+                position = positions[group]
+                while (
+                    position < len(bucket)
+                    and bucket[position].chunk_id in seen_chunks
+                ):
+                    position += 1
+                positions[group] = position
+                if position >= len(bucket):
+                    continue
+                candidate = bucket[position]
+                positions[group] += 1
+                selected.append(candidate)
+                seen_chunks.add(candidate.chunk_id)
+                progressed = True
+                if len(selected) >= top_k:
+                    break
+            if not progressed:
+                break
+
+        if len(selected) < top_k:
+            for candidate in ranked:
+                if candidate.chunk_id in seen_chunks:
+                    continue
+                selected.append(candidate)
+                seen_chunks.add(candidate.chunk_id)
+                if len(selected) >= top_k:
+                    break
+
+        return selected, {
+            "enabled": True,
+            "facets": facets,
+            "groups": ordered_groups,
+            "group_count": len(ordered_groups),
+        }
 
     @staticmethod
     def _title_score(query: str, document: Document) -> float:
@@ -580,6 +729,7 @@ class CorpusTools:
         query: str,
         *,
         mode: str = "hybrid",
+        query_variants: list[str] | None = None,
         exact_terms: list[str] | None = None,
         document_ids: list[str] | None = None,
         boost_document_ids: list[str] | None = None,
@@ -587,12 +737,14 @@ class CorpusTools:
     ) -> ToolResult:
         started = time.perf_counter()
         query = " ".join(str(query or "").split())
+        cleaned_variants = self._clean_query_variants(query, query_variants)
         scope, scope_status = self._scope(document_ids)
         if scope_status != "ok":
             return ToolResult(
                 tool="search",
                 arguments={
                     "query": query,
+                    "query_variants": cleaned_variants,
                     "mode": mode,
                     "document_ids": list(document_ids or []),
                     "boost_document_ids": list(boost_document_ids or []),
@@ -639,6 +791,40 @@ class CorpusTools:
             for candidate in values:
                 candidate.sources.add(f"agent:{name}")
             lanes.append((name, values, weight))
+
+        if cleaned_variants and mode in {"lexical", "hybrid"}:
+            for index, variant in enumerate(cleaned_variants):
+                run_lane(
+                    f"variant_lexical_{index + 1}",
+                    0.95,
+                    lambda variant=variant: self.search_engine.lexical(
+                        variant,
+                        self.user,
+                        scope,
+                        per_lane_k,
+                    ),
+                )
+                run_lane(
+                    f"variant_exact_{index + 1}",
+                    1.05,
+                    lambda variant=variant: self.search_engine.exact(
+                        variant,
+                        self.user,
+                        scope,
+                        per_lane_k,
+                    ),
+                )
+                if self.settings.relaxed_lexical_enabled:
+                    run_lane(
+                        f"variant_relaxed_{index + 1}",
+                        0.75,
+                        lambda variant=variant: self.search_engine.relaxed_lexical(
+                            variant,
+                            self.user,
+                            scope,
+                            per_lane_k,
+                        ),
+                    )
 
         if query and mode in {"lexical", "hybrid"}:
             run_lane(
@@ -810,6 +996,7 @@ class CorpusTools:
                 tool="search",
                 arguments={
                     "query": query,
+                    "query_variants": cleaned_variants,
                     "mode": mode,
                     "exact_terms": cleaned_terms,
                     "document_ids": [str(value) for value in (scope or [])],
@@ -831,7 +1018,7 @@ class CorpusTools:
         for chunk_id, (score, sources) in fused.items():
             candidate = pool[chunk_id]
             direct_score = self._direct_evidence_score(
-                query,
+                " ".join([query, *cleaned_variants]).strip(),
                 cleaned_terms,
                 candidate,
             )
@@ -861,6 +1048,7 @@ class CorpusTools:
             tool="search",
             arguments={
                 "query": query,
+                "query_variants": cleaned_variants,
                 "mode": mode,
                 "exact_terms": cleaned_terms,
                 "document_ids": [str(value) for value in (scope or [])],
@@ -900,24 +1088,29 @@ class CorpusTools:
         query: str,
         *,
         mode: str = "lexical",
+        query_variants: list[str] | None = None,
         exact_terms: list[str] | None = None,
         document_ids: list[str] | None = None,
         boost_document_ids: list[str] | None = None,
+        coverage_facets: list[str] | None = None,
         top_k: int | None = None,
     ) -> ToolResult:
         """Broader candidate retrieval for AI-requested exhaustive/list questions."""
 
         started = time.perf_counter()
         query = " ".join(str(query or "").split())
+        cleaned_variants = self._clean_query_variants(query, query_variants)
         scope, scope_status = self._scope(document_ids)
         if scope_status != "ok":
             return ToolResult(
                 tool="enumerate",
                 arguments={
                     "query": query,
+                    "query_variants": cleaned_variants,
                     "mode": mode,
                     "document_ids": list(document_ids or []),
                     "boost_document_ids": list(boost_document_ids or []),
+                    "coverage_facets": list(coverage_facets or []),
                 },
                 metadata={"scope_status": scope_status},
                 elapsed_ms=int((time.perf_counter() - started) * 1000),
@@ -958,6 +1151,40 @@ class CorpusTools:
             for candidate in values:
                 candidate.sources.add(f"agent:enumerate:{name}")
             lanes.append((name, values, weight))
+
+        if cleaned_variants and mode in {"lexical", "hybrid"}:
+            for index, variant in enumerate(cleaned_variants):
+                run_lane(
+                    f"variant_lexical_{index + 1}",
+                    0.95,
+                    lambda variant=variant: self.search_engine.lexical(
+                        variant,
+                        self.user,
+                        scope,
+                        per_lane_k,
+                    ),
+                )
+                run_lane(
+                    f"variant_exact_{index + 1}",
+                    1.05,
+                    lambda variant=variant: self.search_engine.exact(
+                        variant,
+                        self.user,
+                        scope,
+                        per_lane_k,
+                    ),
+                )
+                if self.settings.relaxed_lexical_enabled:
+                    run_lane(
+                        f"variant_relaxed_{index + 1}",
+                        0.75,
+                        lambda variant=variant: self.search_engine.relaxed_lexical(
+                            variant,
+                            self.user,
+                            scope,
+                            per_lane_k,
+                        ),
+                    )
 
         if query and mode in {"lexical", "hybrid"}:
             run_lane(
@@ -1122,10 +1349,12 @@ class CorpusTools:
                 tool="enumerate",
                 arguments={
                     "query": query,
+                    "query_variants": cleaned_variants,
                     "mode": mode,
                     "exact_terms": cleaned_terms,
                     "document_ids": [str(value) for value in (scope or [])],
                     "boost_document_ids": [str(value) for value in boost_scope],
+                    "coverage_facets": list(coverage_facets or []),
                     "top_k": top_k,
                 },
                 metadata={
@@ -1143,7 +1372,7 @@ class CorpusTools:
         for chunk_id, (score, sources) in fused.items():
             candidate = pool[chunk_id]
             direct_score = self._direct_evidence_score(
-                query,
+                " ".join([query, *cleaned_variants]).strip(),
                 cleaned_terms,
                 candidate,
             )
@@ -1165,6 +1394,11 @@ class CorpusTools:
             ),
             reverse=True,
         )
+        ranked, coverage_metadata = self._balance_enumeration_coverage(
+            ranked,
+            coverage_facets=coverage_facets,
+            top_k=top_k,
+        )
         ranked, rerank_metadata = self._rerank_candidates(
             query,
             ranked,
@@ -1175,10 +1409,12 @@ class CorpusTools:
             tool="enumerate",
             arguments={
                 "query": query,
+                "query_variants": cleaned_variants,
                 "mode": mode,
                 "exact_terms": cleaned_terms,
                 "document_ids": [str(value) for value in (scope or [])],
                 "boost_document_ids": [str(value) for value in boost_scope],
+                "coverage_facets": list(coverage_facets or []),
                 "top_k": top_k,
             },
             items=[self._item(candidate) for candidate in ranked],
@@ -1194,14 +1430,16 @@ class CorpusTools:
                 "source_prior_candidate_count": len(source_prior_ids),
                 "table_section_prior_candidate_count": len(table_section_prior_ids),
                 "exhaustive_candidate_mode": True,
+                "coverage_balance": coverage_metadata,
                 "reranked": rerank_metadata.get("status") == "ok",
                 "rerank": rerank_metadata,
             },
             elapsed_ms=int((time.perf_counter() - started) * 1000),
             note=(
                 "Broad global candidate retrieval for a bounded/exhaustive question, "
-                "including structured-table lanes. AI-inferred source candidates are soft "
-                "ranking hints only. "
+                "including structured-table lanes and generic facet-balanced coverage when "
+                "the planner requested it. AI-inferred source candidates are soft ranking "
+                "hints only. "
                 + (
                     "A local cross-encoder reranked the broad evidence set."
                     if rerank_metadata.get("status") == "ok"

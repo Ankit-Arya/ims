@@ -26,8 +26,18 @@ class ResearchTask(BaseModel):
         "context",
     ] = "search"
     query: str = Field(default="", max_length=1400)
+    query_variants: list[str] = Field(default_factory=list, max_length=4)
     search_mode: Literal["lexical", "semantic", "hybrid"] = "hybrid"
     exact_terms: list[str] = Field(default_factory=list, max_length=8)
+    coverage_facets: list[
+        Literal[
+            "rolling_stock",
+            "line_code",
+            "document_family",
+            "document_type",
+            "document",
+        ]
+    ] = Field(default_factory=list, max_length=3)
     source_query: str = Field(default="", max_length=500)
     document_id: str | None = None
     chunk_id: str | None = None
@@ -39,7 +49,9 @@ class ResearchTask(BaseModel):
 
     @field_validator(
         "requirement_ids",
+        "query_variants",
         "exact_terms",
+        "coverage_facets",
         "depends_on",
         mode="before",
     )
@@ -106,6 +118,34 @@ class RequirementAssessment(BaseModel):
     status: Literal["supported", "partial", "missing"]
     evidence_ids: list[str] = Field(default_factory=list, max_length=40)
     note: str = Field(default="", max_length=900)
+
+
+class EvidenceSelectionAssessment(BaseModel):
+    requirement_id: str = Field(min_length=1, max_length=64)
+    status: Literal["covered", "partial", "missing"]
+    evidence_ids: list[str] = Field(default_factory=list, max_length=24)
+    coverage_groups: list[str] = Field(default_factory=list, max_length=40)
+    note: str = Field(default="", max_length=800)
+
+
+class EvidenceSelectionDecision(BaseModel):
+    """Compact AI shortlist before expensive answer reasoning."""
+
+    selected_evidence_ids: list[str] = Field(default_factory=list, max_length=24)
+    requirement_assessments: list[EvidenceSelectionAssessment] = Field(
+        min_length=1,
+        max_length=12,
+    )
+    suspected_gaps: list[str] = Field(default_factory=list, max_length=12)
+
+    @field_validator("selected_evidence_ids", "suspected_gaps", mode="before")
+    @classmethod
+    def _coerce_selection_lists(cls, value):
+        if value in (None, ""):
+            return []
+        if isinstance(value, str):
+            return [value] if value.strip() else []
+        return value
 
 
 class AnswerDecision(BaseModel):

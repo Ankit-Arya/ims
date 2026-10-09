@@ -93,7 +93,7 @@ def build_query_debug_report(
     user: User,
     log: QueryLog,
 ) -> dict:
-    """Build a v5 planned-research diagnostic from the persisted query trace."""
+    """Build the current planned-research diagnostic from the persisted query trace."""
 
     trace = _as_dict(log.retrieval_trace)
     tool_calls = [
@@ -103,7 +103,7 @@ def build_query_debug_report(
     ]
 
     return {
-        "debug_version": 5,
+        "debug_version": 6,
         "query_id": str(log.id),
         "created_at": log.created_at.isoformat() if log.created_at else None,
         "original_question": log.question,
@@ -114,7 +114,17 @@ def build_query_debug_report(
         "planner_reasoning": trace.get("planner_reasoning"),
         "answer_model": trace.get("answer_model"),
         "answer_reasoning": trace.get("answer_reasoning"),
+        "evidence_selector_model": trace.get("evidence_selector_model"),
+        "evidence_selector_reasoning": trace.get("evidence_selector_reasoning"),
         "research_plan": _as_dict(trace.get("research_plan")),
+        "primary_evidence_selection": _as_dict(
+            trace.get("primary_evidence_selection")
+        ),
+        "primary_evidence_selection_error": trace.get(
+            "primary_evidence_selection_error"
+        ),
+        "gap_evidence_selection": _as_dict(trace.get("gap_evidence_selection")),
+        "gap_evidence_selection_error": trace.get("gap_evidence_selection_error"),
         "first_answer_decision": _as_dict(trace.get("first_answer_decision")),
         "final_answer_decision": _as_dict(trace.get("final_answer_decision")),
         "tool_calls": tool_calls,
@@ -129,9 +139,10 @@ def build_query_debug_report(
         "final_answer": log.answer,
         "citations": log.citations or [],
         "notes": [
-            "The Query Intelligence Agent creates the research graph.",
-            "Python executes retrieval tasks and resource limits but does not decide semantic sufficiency.",
-            "The Evidence/Answer Agent selects applicability, requests at most one targeted gap round, and writes the answer.",
+            "The Query Intelligence Agent creates the research graph and coverage strategy.",
+            "Python executes access-safe retrieval, query variants, source boosts, coverage balancing and resource limits.",
+            "A fast Evidence Selection Agent semantically shortlists retrieved chunks before strong answer reasoning; its selection is advisory and failures fall back safely.",
+            "The Evidence/Answer Agent independently verifies applicability, requests at most one targeted gap round, and writes the answer.",
             "Selected evidence is reloaded through the current user's ACL for this diagnostic.",
         ],
     }
@@ -161,6 +172,10 @@ def debug_report_markdown(report: dict) -> str:
         + _cell(report.get("answer_model"))
         + " / "
         + _cell(report.get("answer_reasoning")),
+        "- Evidence selector: "
+        + _cell(report.get("evidence_selector_model"))
+        + " / "
+        + _cell(report.get("evidence_selector_reasoning")),
         "- Evidence status: " + _cell(report.get("agent_evidence_status")),
         "- Stop reason: " + _cell(report.get("agent_stop_reason")),
         "",
@@ -241,6 +256,28 @@ def debug_report_markdown(report: dict) -> str:
                 )
         lines.append("")
 
+    if report.get("primary_evidence_selection") or report.get(
+        "primary_evidence_selection_error"
+    ):
+        lines.extend(
+            [
+                "## Fast AI evidence shortlist",
+                "",
+                "- Selector error: "
+                + _cell(report.get("primary_evidence_selection_error") or "none"),
+                "",
+                "~~~json",
+                json.dumps(
+                    report.get("primary_evidence_selection"),
+                    ensure_ascii=False,
+                    indent=2,
+                    default=str,
+                ),
+                "~~~",
+                "",
+            ]
+        )
+
     lines.extend(
         [
             "## First evidence/answer decision",
@@ -255,6 +292,28 @@ def debug_report_markdown(report: dict) -> str:
             "~~~",
         ]
     )
+
+    if report.get("gap_evidence_selection") or report.get(
+        "gap_evidence_selection_error"
+    ):
+        lines.extend(
+            [
+                "",
+                "## Refreshed AI evidence shortlist after gap research",
+                "",
+                "- Selector error: "
+                + _cell(report.get("gap_evidence_selection_error") or "none"),
+                "",
+                "~~~json",
+                json.dumps(
+                    report.get("gap_evidence_selection"),
+                    ensure_ascii=False,
+                    indent=2,
+                    default=str,
+                ),
+                "~~~",
+            ]
+        )
 
     if report.get("final_answer_decision"):
         lines.extend(
