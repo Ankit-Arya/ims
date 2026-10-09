@@ -260,6 +260,61 @@ class SearchEngine:
             candidate.sources.add("table")
         return candidates
 
+    def table_relaxed_lexical(
+        self,
+        query: str,
+        user: User,
+        document_ids: list[UUID] | None,
+        top_k: int,
+    ) -> list[Candidate]:
+        expression = relaxed_websearch_expression(query, max_terms=12)
+        if not expression:
+            return []
+        tsquery = func.websearch_to_tsquery("simple", expression)
+        rank = func.ts_rank_cd(Chunk.search_vector, tsquery).label("rank")
+        stmt = (
+            select(Chunk, Document, rank)
+            .join(Document, Document.id == Chunk.document_id)
+            .where(
+                *self._base_filters(user, document_ids),
+                Chunk.content_kind == "table",
+                Chunk.search_vector.op("@@")(tsquery),
+            )
+            .order_by(desc(rank), Document.id, Chunk.ordinal)
+            .limit(top_k)
+        )
+        candidates = [self.candidate(row[0], row[1]) for row in self.db.execute(stmt).all()]
+        for candidate in candidates:
+            candidate.sources.add("table_relaxed")
+        return candidates
+
+    def table_exact(
+        self,
+        query: str,
+        user: User,
+        document_ids: list[UUID] | None,
+        top_k: int,
+    ) -> list[Candidate]:
+        cleaned = re.sub(r"\s+", " ", query.strip())
+        if len(cleaned) < 2 or len(cleaned) > 220:
+            return []
+        pattern = f"%{_escape_like(cleaned)}%"
+        stmt = (
+            select(Chunk, Document)
+            .join(Document, Document.id == Chunk.document_id)
+            .where(
+                *self._base_filters(user, document_ids),
+                Chunk.content_kind == "table",
+                Chunk.contextual_text.ilike(pattern, escape="\\"),
+            )
+            .order_by(Chunk.document_id, Chunk.ordinal)
+            .limit(top_k)
+        )
+        candidates = [self.candidate(row[0], row[1]) for row in self.db.execute(stmt).all()]
+        for candidate in candidates:
+            candidate.sources.add("table_exact")
+        return candidates
+
     def exact(
         self,
         query: str,

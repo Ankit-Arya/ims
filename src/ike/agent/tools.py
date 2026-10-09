@@ -15,7 +15,12 @@ from ike.retrieval.access import document_access_clause
 from ike.retrieval.evidence_selection import deduplicate_candidates
 from ike.retrieval.fusion import reciprocal_rank_fusion
 from ike.retrieval.search_engine import SearchEngine
-from ike.retrieval.search_plan import content_tokens, token_overlap
+from ike.retrieval.search_plan import (
+    content_tokens,
+    table_retrieval_relevant,
+    token_overlap,
+)
+from ike.retrieval.table_context import retrieval_text, table_query_affinity
 from ike.retrieval.types import Candidate
 
 
@@ -122,6 +127,10 @@ class CorpusTools:
                 6,
             ),
             "sources": sorted(candidate.sources),
+            "direct_score": round(
+                float(candidate.judge_details.get("direct_evidence_score", 0.0) or 0.0),
+                6,
+            ),
             "snippet": " ".join(
                 (candidate.text or candidate.contextual_text or "").split()
             )[:1800],
@@ -141,6 +150,199 @@ class CorpusTools:
         )
 
     @staticmethod
+    def _rerank_text(candidate: Candidate) -> str:
+        section = " > ".join(
+            str(value).strip()
+            for value in (candidate.section_path or [])[-2:]
+            if str(value).strip()
+        )
+        prefix = [
+            f"Document: {candidate.document_title}",
+            f"File: {candidate.filename}",
+        ]
+        if section:
+            prefix.append(f"Section: {section}")
+        return "\n".join(prefix + [retrieval_text(candidate)])
+
+    def _rerank_candidates(
+        self,
+        query: str,
+        ranked: list[Candidate],
+        *,
+        top_k: int,
+        pool_limit: int,
+    ) -> tuple[list[Candidate], dict]:
+        if not ranked:
+            return [], {"status": "empty"}
+        pool = deduplicate_candidates(ranked)[: max(top_k, pool_limit)]
+        if not self.settings.agent_rerank_enabled or len(pool) <= 1:
+            return pool[:top_k], {
+                "status": "disabled",
+                "candidate_count": len(pool),
+            }
+        try:
+            results, timing = self.search_engine.inference.rerank(
+                query,
+                [self._rerank_text(candidate) for candidate in pool],
+                top_k=min(top_k, len(pool)),
+                request_id=self.request_id,
+            )
+        except Exception as exc:
+            return pool[:top_k], {
+                "status": "failed",
+                "candidate_count": len(pool),
+                "error_type": type(exc).__name__,
+            }
+
+        selected: list[Candidate] = []
+        for result in results:
+            if result.index < 0 or result.index >= len(pool):
+                continue
+            candidate = pool[result.index]
+            candidate.rerank_score = float(result.score)
+            candidate.final_retrieval_score = (
+                float(result.score)
+                + table_query_affinity(query, candidate)
+            )
+            candidate.rank_method = "agent_local_cross_encoder"
+            candidate.sources.add("agent:local_rerank")
+            selected.append(candidate)
+        return selected, {
+            "status": "ok",
+            "candidate_count": len(pool),
+            "returned_count": len(selected),
+            "queue_wait_ms": timing.queue_wait_ms,
+            "execution_ms": timing.execution_ms,
+            "details": timing.details,
+        }
+
+    @classmethod
+    def _direct_evidence_score(
+        cls,
+        query: str,
+        exact_terms: list[str],
+        candidate: Candidate,
+    ) -> float:
+        """Cheap query-to-chunk affinity before any optional cross-encoder rerank."""
+
+        text = cls._rerank_text(candidate)
+        if not text:
+            return 0.0
+        score = 0.10 * token_overlap(query, text)
+        score += 0.025 * token_overlap(query, candidate.document_title or "")
+
+        normalized_text = re.sub(r"[^a-z0-9]+", " ", text.casefold()).strip()
+        matched_terms = 0
+        literal_hits = 0
+        for term in exact_terms:
+            normalized_term = re.sub(
+                r"[^a-z0-9]+",
+                " ",
+                str(term or "").casefold(),
+            ).strip()
+            if not normalized_term:
+                continue
+            term_tokens = normalized_term.split()
+            if all(token in normalized_text.split() for token in term_tokens):
+                matched_terms += 1
+            if len(normalized_term) >= 4 and normalized_term in normalized_text:
+                literal_hits += 1
+        if exact_terms:
+            score += 0.08 * (matched_terms / max(1, len(exact_terms)))
+        score += min(0.06, 0.02 * literal_hits)
+        score += 0.30 * table_query_affinity(query, candidate)
+        return score
+
+    @staticmethod
+    def _table_section_prior_ids(
+        lanes: list[tuple[str, list[Candidate], float]],
+    ) -> list[UUID]:
+        """Fuse exact table-term hits that occur across chunks of one table section."""
+
+        section_terms: dict[tuple[UUID, tuple[str, ...]], set[str]] = {}
+        chunk_sections: dict[UUID, tuple[UUID, tuple[str, ...]]] = {}
+        best_rank: dict[UUID, int] = {}
+        chunk_lane_hits: dict[UUID, int] = {}
+
+        for lane_name, values, _weight in lanes:
+            if not lane_name.startswith("table_exact_term_"):
+                continue
+            for rank, candidate in enumerate(values):
+                path = tuple(
+                    str(value).strip().casefold()
+                    for value in (candidate.section_path or [])
+                    if str(value).strip()
+                )
+                if not path:
+                    continue
+                section_key = (candidate.document_id, path)
+                section_terms.setdefault(section_key, set()).add(lane_name)
+                chunk_sections[candidate.chunk_id] = section_key
+                best_rank[candidate.chunk_id] = min(
+                    rank,
+                    best_rank.get(candidate.chunk_id, rank),
+                )
+                chunk_lane_hits[candidate.chunk_id] = (
+                    chunk_lane_hits.get(candidate.chunk_id, 0) + 1
+                )
+
+        qualified = {
+            key: len(term_lanes)
+            for key, term_lanes in section_terms.items()
+            if len(term_lanes) >= 2
+        }
+        if not qualified:
+            return []
+
+        chunk_ids = [
+            chunk_id
+            for chunk_id, section_key in chunk_sections.items()
+            if section_key in qualified
+        ]
+        chunk_ids.sort(
+            key=lambda chunk_id: (
+                -qualified[chunk_sections[chunk_id]],
+                -chunk_lane_hits.get(chunk_id, 0),
+                best_rank.get(chunk_id, 10**9),
+            )
+        )
+        return chunk_ids
+
+    @staticmethod
+    def _source_prior_ids(
+        lanes: list[tuple[str, list[Candidate], float]],
+        boost_document_ids: list[UUID] | None,
+    ) -> list[UUID]:
+        if not boost_document_ids:
+            return []
+        source_rank = {
+            document_id: index
+            for index, document_id in enumerate(boost_document_ids)
+        }
+        best_lane_rank: dict[UUID, int] = {}
+        candidates: dict[UUID, Candidate] = {}
+        for _name, values, _weight in lanes:
+            for rank, candidate in enumerate(values):
+                candidates[candidate.chunk_id] = candidate
+                best_lane_rank[candidate.chunk_id] = min(
+                    rank,
+                    best_lane_rank.get(candidate.chunk_id, rank),
+                )
+        boosted = [
+            candidate
+            for candidate in candidates.values()
+            if candidate.document_id in source_rank
+        ]
+        boosted.sort(
+            key=lambda candidate: (
+                source_rank[candidate.document_id],
+                best_lane_rank.get(candidate.chunk_id, 10**9),
+                candidate.ordinal,
+            )
+        )
+        return [candidate.chunk_id for candidate in boosted]
+
+    @staticmethod
     def _title_score(query: str, document: Document) -> float:
         title = f"{document.title or ''} {document.original_filename or ''}".strip()
         if not title:
@@ -157,6 +359,41 @@ class CorpusTools:
         tokens = [value for value in re.findall(r"[a-z0-9]+", q) if len(value) >= 2]
         if tokens and all(token in t for token in tokens):
             score += 4.0
+
+        # Preserve canonical short document identities/acronyms when the query literally
+        # names them. This is generic source fidelity, not a domain-specific alias table.
+        aliases = {
+            str(document.title or "").strip(),
+            re.sub(
+                r"\.[a-z0-9]{1,6}$",
+                "",
+                str(document.original_filename or "").strip(),
+                flags=re.IGNORECASE,
+            ),
+        }
+        for alias in aliases:
+            alias_folded = alias.casefold().strip()
+            if not alias_folded or len(alias_folded) > 48:
+                continue
+            alias_tokens = re.findall(r"[a-z0-9]+", alias_folded)
+            if not alias_tokens or len(alias_tokens) > 5:
+                continue
+            pattern = r"(?<![a-z0-9])" + r"[\s._/-]*".join(
+                re.escape(token) for token in alias_tokens
+            ) + r"(?![a-z0-9])"
+            if re.search(pattern, q):
+                score += 24.0
+
+        # Also preserve acronym-like identity tokens embedded in longer filenames/titles,
+        # e.g. a numbered file whose canonical identity is one uppercase token.
+        raw_identity = f"{document.title or ''} {document.original_filename or ''}"
+        for acronym in set(re.findall(r"(?<![A-Za-z0-9])[A-Z][A-Z0-9_-]{2,12}(?![A-Za-z0-9])", raw_identity)):
+            acronym_folded = acronym.casefold()
+            if re.search(
+                r"(?<![a-z0-9])" + re.escape(acronym_folded) + r"(?![a-z0-9])",
+                q,
+            ):
+                score += 36.0
 
         # Strongly preserve letter-number technical identifiers during source routing
         # (for example RS2, RS-10, L7, TS318) without hard-coding any product family.
@@ -332,8 +569,9 @@ class CorpusTools:
             },
             elapsed_ms=int((time.perf_counter() - started) * 1000),
             note=(
-                "Document routing candidates from title plus corpus-level section hints. "
-                "The AI chooses applicability."
+                "Document routing candidates from title, metadata and corpus-level section "
+                "hints. Inferred candidates are soft ranking hints; only explicit document "
+                "scope can restrict chunk retrieval."
             ),
         )
 
@@ -344,6 +582,7 @@ class CorpusTools:
         mode: str = "hybrid",
         exact_terms: list[str] | None = None,
         document_ids: list[str] | None = None,
+        boost_document_ids: list[str] | None = None,
         top_k: int | None = None,
     ) -> ToolResult:
         started = time.perf_counter()
@@ -356,20 +595,39 @@ class CorpusTools:
                     "query": query,
                     "mode": mode,
                     "document_ids": list(document_ids or []),
+                    "boost_document_ids": list(boost_document_ids or []),
                 },
                 metadata={"scope_status": scope_status},
                 elapsed_ms=int((time.perf_counter() - started) * 1000),
-                note="Requested scope was rejected.",
+                note="Requested hard document scope was rejected.",
             )
+
+        boost_scope: list[UUID] = []
+        boost_status = "not_requested"
+        if boost_document_ids:
+            resolved_boost, boost_status = self._scope(boost_document_ids)
+            if boost_status == "ok":
+                boost_scope = list(resolved_boost or [])
 
         mode = mode if mode in {"lexical", "semantic", "hybrid"} else "hybrid"
         top_k = min(
-            max(4, int(top_k or self.settings.agent_search_top_k)),
+            max(
+                self.settings.agent_search_top_k,
+                int(top_k or self.settings.agent_search_top_k),
+            ),
             self.settings.agent_search_max_top_k,
         )
-        per_lane_k = max(top_k, self.settings.agent_search_prefilter_k)
+        per_lane_k = max(
+            top_k,
+            self.settings.agent_search_prefilter_k,
+        )
         lanes: list[tuple[str, list[Candidate], float]] = []
         lane_status: dict[str, str] = {}
+        table_relevant = table_retrieval_relevant(
+            goal_kinds=[],
+            facets=[],
+            question=query,
+        )
 
         def run_lane(name: str, weight: float, fn) -> None:
             try:
@@ -403,6 +661,60 @@ class CorpusTools:
                     per_lane_k,
                 ),
             )
+            if self.settings.relaxed_lexical_enabled:
+                run_lane(
+                    "relaxed",
+                    0.8,
+                    lambda: self.search_engine.relaxed_lexical(
+                        query,
+                        self.user,
+                        scope,
+                        per_lane_k,
+                    ),
+                )
+            if boost_scope:
+                run_lane(
+                    "source_lexical",
+                    0.9,
+                    lambda: self.search_engine.lexical(
+                        query,
+                        self.user,
+                        boost_scope,
+                        per_lane_k,
+                    ),
+                )
+                if self.settings.relaxed_lexical_enabled:
+                    run_lane(
+                        "source_relaxed",
+                        0.8,
+                        lambda: self.search_engine.relaxed_lexical(
+                            query,
+                            self.user,
+                            boost_scope,
+                            per_lane_k,
+                        ),
+                    )
+            if table_relevant:
+                run_lane(
+                    "table_lexical",
+                    1.05,
+                    lambda: self.search_engine.table_lexical(
+                        query,
+                        self.user,
+                        scope,
+                        per_lane_k,
+                    ),
+                )
+                run_lane(
+                    "table_relaxed",
+                    1.0,
+                    lambda: self.search_engine.table_relaxed_lexical(
+                        query,
+                        self.user,
+                        scope,
+                        per_lane_k,
+                    ),
+                )
 
         cleaned_terms: list[str] = []
         seen_terms: set[str] = set()
@@ -426,18 +738,52 @@ class CorpusTools:
                     per_lane_k,
                 ),
             )
+            if boost_scope:
+                run_lane(
+                    f"source_exact_term_{index + 1}",
+                    1.0,
+                    lambda term=term: self.search_engine.exact(
+                        term,
+                        self.user,
+                        boost_scope,
+                        per_lane_k,
+                    ),
+                )
+            if table_relevant:
+                run_lane(
+                    f"table_exact_term_{index + 1}",
+                    1.35,
+                    lambda term=term: self.search_engine.table_exact(
+                        term,
+                        self.user,
+                        scope,
+                        per_lane_k,
+                    ),
+                )
 
         if query and mode in {"semantic", "hybrid"}:
-            def dense_values() -> list[Candidate]:
-                vector = self.search_engine.inference.embed_query(query)
-                return self.search_engine.dense(
+            vector = self.search_engine.inference.embed_query(query)
+            run_lane(
+                "dense",
+                1.0,
+                lambda: self.search_engine.dense(
                     vector,
                     self.user,
                     scope,
                     per_lane_k,
+                ),
+            )
+            if boost_scope:
+                run_lane(
+                    "source_dense",
+                    0.9,
+                    lambda: self.search_engine.dense(
+                        vector,
+                        self.user,
+                        boost_scope,
+                        per_lane_k,
+                    ),
                 )
-
-            run_lane("dense", 1.0, dense_values)
 
         pool: dict[UUID, Candidate] = {}
         ranked_lists: list[tuple[str, list[UUID], float]] = []
@@ -450,6 +796,15 @@ class CorpusTools:
             for candidate in values:
                 self._merge(pool, candidate)
 
+        source_prior_ids = self._source_prior_ids(lanes, boost_scope)
+        if source_prior_ids:
+            ranked_lists.append(("source_prior", source_prior_ids, 0.45))
+        table_section_prior_ids = self._table_section_prior_ids(lanes)
+        if table_section_prior_ids:
+            ranked_lists.append(
+                ("table_section_prior", table_section_prior_ids, 1.10)
+            )
+
         if not ranked_lists:
             return ToolResult(
                 tool="search",
@@ -458,10 +813,12 @@ class CorpusTools:
                     "mode": mode,
                     "exact_terms": cleaned_terms,
                     "document_ids": [str(value) for value in (scope or [])],
+                    "boost_document_ids": [str(value) for value in boost_scope],
                     "top_k": top_k,
                 },
                 metadata={
                     "scope_status": "ok",
+                    "boost_status": boost_status,
                     "lane_status": lane_status,
                     "candidate_count": 0,
                 },
@@ -473,13 +830,18 @@ class CorpusTools:
         ranked: list[Candidate] = []
         for chunk_id, (score, sources) in fused.items():
             candidate = pool[chunk_id]
-            candidate.fused_score = max(candidate.fused_score, score)
-            candidate.final_retrieval_score = max(
-                candidate.final_retrieval_score,
-                score,
+            direct_score = self._direct_evidence_score(
+                query,
+                cleaned_terms,
+                candidate,
             )
-            candidate.rank_method = "agent_fast_rrf"
+            candidate.judge_details["direct_evidence_score"] = direct_score
+            candidate.fused_score = max(candidate.fused_score, score)
+            candidate.final_retrieval_score = score + direct_score
+            candidate.rank_method = "agent_global_rrf_direct"
             candidate.sources.update(f"agent:{source}" for source in sources)
+            if direct_score > 0:
+                candidate.sources.add("agent:direct_match")
             ranked.append(candidate)
 
         ranked.sort(
@@ -489,7 +851,12 @@ class CorpusTools:
             ),
             reverse=True,
         )
-        ranked = deduplicate_candidates(ranked)[:top_k]
+        ranked, rerank_metadata = self._rerank_candidates(
+            query,
+            ranked,
+            top_k=top_k,
+            pool_limit=self.settings.agent_search_rerank_candidates,
+        )
         return ToolResult(
             tool="search",
             arguments={
@@ -497,21 +864,35 @@ class CorpusTools:
                 "mode": mode,
                 "exact_terms": cleaned_terms,
                 "document_ids": [str(value) for value in (scope or [])],
+                "boost_document_ids": [str(value) for value in boost_scope],
                 "top_k": top_k,
             },
             items=[self._item(candidate) for candidate in ranked],
             candidates=ranked,
             metadata={
                 "scope_status": "ok",
+                "boost_status": boost_status,
                 "lane_status": lane_status,
                 "candidate_count": len(ranked),
                 "document_ids_returned": sorted(
                     {str(candidate.document_id) for candidate in ranked}
                 ),
-                "reranked": False,
+                "source_prior_candidate_count": len(source_prior_ids),
+                "table_section_prior_candidate_count": len(table_section_prior_ids),
+                "reranked": rerank_metadata.get("status") == "ok",
+                "rerank": rerank_metadata,
             },
             elapsed_ms=int((time.perf_counter() - started) * 1000),
-            note="Fast retrieval bundle; semantic relevance is decided by the AI.",
+            note=(
+                "Global chunk retrieval with lexical, exact, semantic and applicable "
+                "structured-table lanes. AI-inferred source candidates are soft ranking "
+                "hints only. "
+                + (
+                    "A local cross-encoder reranked the evidence pool."
+                    if rerank_metadata.get("status") == "ok"
+                    else "Deterministic fusion/direct-match scoring ranked the evidence pool."
+                )
+            ),
         )
 
     def enumerate(
@@ -521,6 +902,7 @@ class CorpusTools:
         mode: str = "lexical",
         exact_terms: list[str] | None = None,
         document_ids: list[str] | None = None,
+        boost_document_ids: list[str] | None = None,
         top_k: int | None = None,
     ) -> ToolResult:
         """Broader candidate retrieval for AI-requested exhaustive/list questions."""
@@ -535,16 +917,24 @@ class CorpusTools:
                     "query": query,
                     "mode": mode,
                     "document_ids": list(document_ids or []),
+                    "boost_document_ids": list(boost_document_ids or []),
                 },
                 metadata={"scope_status": scope_status},
                 elapsed_ms=int((time.perf_counter() - started) * 1000),
-                note="Requested scope was rejected.",
+                note="Requested hard document scope was rejected.",
             )
+
+        boost_scope: list[UUID] = []
+        boost_status = "not_requested"
+        if boost_document_ids:
+            resolved_boost, boost_status = self._scope(boost_document_ids)
+            if boost_status == "ok":
+                boost_scope = list(resolved_boost or [])
 
         mode = mode if mode in {"lexical", "semantic", "hybrid"} else "lexical"
         top_k = min(
             max(
-                self.settings.agent_enumeration_top_k,
+                16,
                 int(top_k or self.settings.agent_enumeration_top_k),
             ),
             self.settings.agent_enumeration_max_top_k,
@@ -552,6 +942,11 @@ class CorpusTools:
         per_lane_k = max(top_k, self.settings.agent_enumeration_prefilter_k)
         lanes: list[tuple[str, list[Candidate], float]] = []
         lane_status: dict[str, str] = {}
+        table_relevant = table_retrieval_relevant(
+            goal_kinds=["enumeration"],
+            facets=[],
+            question=query,
+        )
 
         def run_lane(name: str, weight: float, fn) -> None:
             try:
@@ -585,6 +980,48 @@ class CorpusTools:
                     per_lane_k,
                 ),
             )
+            if boost_scope:
+                run_lane(
+                    "source_lexical",
+                    0.9,
+                    lambda: self.search_engine.lexical(
+                        query,
+                        self.user,
+                        boost_scope,
+                        per_lane_k,
+                    ),
+                )
+                run_lane(
+                    "source_relaxed",
+                    0.8,
+                    lambda: self.search_engine.relaxed_lexical(
+                        query,
+                        self.user,
+                        boost_scope,
+                        per_lane_k,
+                    ),
+                )
+            if table_relevant:
+                run_lane(
+                    "table_lexical",
+                    1.05,
+                    lambda: self.search_engine.table_lexical(
+                        query,
+                        self.user,
+                        scope,
+                        per_lane_k,
+                    ),
+                )
+                run_lane(
+                    "table_relaxed",
+                    1.0,
+                    lambda: self.search_engine.table_relaxed_lexical(
+                        query,
+                        self.user,
+                        scope,
+                        per_lane_k,
+                    ),
+                )
 
         cleaned_terms: list[str] = []
         seen_terms: set[str] = set()
@@ -609,18 +1046,56 @@ class CorpusTools:
                     per_lane_k,
                 ),
             )
+            if boost_scope:
+                run_lane(
+                    f"source_exact_term_{index + 1}",
+                    1.0,
+                    lambda term=term: self.search_engine.exact(
+                        term,
+                        self.user,
+                        boost_scope,
+                        per_lane_k,
+                    ),
+                )
+            if table_relevant:
+                run_lane(
+                    f"table_exact_term_{index + 1}",
+                    1.3,
+                    lambda term=term: self.search_engine.table_exact(
+                        term,
+                        self.user,
+                        scope,
+                        per_lane_k,
+                    ),
+                )
 
         if query and mode in {"semantic", "hybrid"}:
-            def dense_values() -> list[Candidate]:
-                vector = self.search_engine.inference.embed_query(query)
-                return self.search_engine.dense(
+            vector = self.search_engine.inference.embed_query(query)
+            dense_k = min(
+                per_lane_k,
+                self.settings.agent_enumeration_dense_top_k,
+            )
+            run_lane(
+                "dense",
+                0.85,
+                lambda: self.search_engine.dense(
                     vector,
                     self.user,
                     scope,
-                    min(per_lane_k, self.settings.agent_enumeration_dense_top_k),
+                    dense_k,
+                ),
+            )
+            if boost_scope:
+                run_lane(
+                    "source_dense",
+                    0.8,
+                    lambda: self.search_engine.dense(
+                        vector,
+                        self.user,
+                        boost_scope,
+                        dense_k,
+                    ),
                 )
-
-            run_lane("dense", 0.85, dense_values)
 
         pool: dict[UUID, Candidate] = {}
         ranked_lists: list[tuple[str, list[UUID], float]] = []
@@ -633,6 +1108,15 @@ class CorpusTools:
             for candidate in values:
                 self._merge(pool, candidate)
 
+        source_prior_ids = self._source_prior_ids(lanes, boost_scope)
+        if source_prior_ids:
+            ranked_lists.append(("source_prior", source_prior_ids, 0.35))
+        table_section_prior_ids = self._table_section_prior_ids(lanes)
+        if table_section_prior_ids:
+            ranked_lists.append(
+                ("table_section_prior", table_section_prior_ids, 1.05)
+            )
+
         if not ranked_lists:
             return ToolResult(
                 tool="enumerate",
@@ -641,10 +1125,12 @@ class CorpusTools:
                     "mode": mode,
                     "exact_terms": cleaned_terms,
                     "document_ids": [str(value) for value in (scope or [])],
+                    "boost_document_ids": [str(value) for value in boost_scope],
                     "top_k": top_k,
                 },
                 metadata={
                     "scope_status": "ok",
+                    "boost_status": boost_status,
                     "lane_status": lane_status,
                     "candidate_count": 0,
                 },
@@ -656,15 +1142,20 @@ class CorpusTools:
         ranked: list[Candidate] = []
         for chunk_id, (score, sources) in fused.items():
             candidate = pool[chunk_id]
-            candidate.fused_score = max(candidate.fused_score, score)
-            candidate.final_retrieval_score = max(
-                candidate.final_retrieval_score,
-                score,
+            direct_score = self._direct_evidence_score(
+                query,
+                cleaned_terms,
+                candidate,
             )
-            candidate.rank_method = "agent_enumeration_rrf"
+            candidate.judge_details["direct_evidence_score"] = direct_score
+            candidate.fused_score = max(candidate.fused_score, score)
+            candidate.final_retrieval_score = score + direct_score
+            candidate.rank_method = "agent_enumeration_rrf_direct"
             candidate.sources.update(
                 f"agent:enumerate:{source}" for source in sources
             )
+            if direct_score > 0:
+                candidate.sources.add("agent:enumerate:direct_match")
             ranked.append(candidate)
 
         ranked.sort(
@@ -674,7 +1165,12 @@ class CorpusTools:
             ),
             reverse=True,
         )
-        ranked = deduplicate_candidates(ranked)[:top_k]
+        ranked, rerank_metadata = self._rerank_candidates(
+            query,
+            ranked,
+            top_k=top_k,
+            pool_limit=self.settings.agent_enumeration_rerank_candidates,
+        )
         return ToolResult(
             tool="enumerate",
             arguments={
@@ -682,23 +1178,35 @@ class CorpusTools:
                 "mode": mode,
                 "exact_terms": cleaned_terms,
                 "document_ids": [str(value) for value in (scope or [])],
+                "boost_document_ids": [str(value) for value in boost_scope],
                 "top_k": top_k,
             },
             items=[self._item(candidate) for candidate in ranked],
             candidates=ranked,
             metadata={
                 "scope_status": "ok",
+                "boost_status": boost_status,
                 "lane_status": lane_status,
                 "candidate_count": len(ranked),
                 "document_ids_returned": sorted(
                     {str(candidate.document_id) for candidate in ranked}
                 ),
+                "source_prior_candidate_count": len(source_prior_ids),
+                "table_section_prior_candidate_count": len(table_section_prior_ids),
                 "exhaustive_candidate_mode": True,
+                "reranked": rerank_metadata.get("status") == "ok",
+                "rerank": rerank_metadata,
             },
             elapsed_ms=int((time.perf_counter() - started) * 1000),
             note=(
-                "Broad candidate retrieval requested by the AI for a bounded/exhaustive "
-                "question. The AI still decides which items belong in the final set."
+                "Broad global candidate retrieval for a bounded/exhaustive question, "
+                "including structured-table lanes. AI-inferred source candidates are soft "
+                "ranking hints only. "
+                + (
+                    "A local cross-encoder reranked the broad evidence set."
+                    if rerank_metadata.get("status") == "ok"
+                    else "Deterministic fusion/direct-match scoring ranked the broad evidence set."
+                )
             ),
         )
 

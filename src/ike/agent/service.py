@@ -343,7 +343,12 @@ class AgenticQAService:
 
         evidence = self._selected_evidence(
             bundle,
-            selected_ids[: self.settings.agent_max_evidence],
+            selected_ids[
+                : min(
+                    self.settings.agent_max_evidence,
+                    self.settings.agent_selected_evidence_cap,
+                )
+            ],
         )
         cited_ids = [item.evidence_id for item in evidence]
         if final_answer and not evidence and plan.needs_corpus:

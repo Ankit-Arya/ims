@@ -140,16 +140,24 @@ class EvidenceAnswerAgent:
         total_output = 0
         feedback = ""
 
+        evidence_limit = min(
+            self.settings.agent_evidence_catalog_limit,
+            self.settings.agent_answer_evidence_cap,
+        )
+        if not any(task.kind == "enumerate" for task in plan.tasks):
+            evidence_limit = min(
+                evidence_limit,
+                max(18, 12 * max(1, len(plan.answer_requirements))),
+            )
+
         for _attempt in range(2):
             user_prompt = answer_user_prompt(
                 question=question,
                 operational_context=operational_context,
                 recent_history=recent_history,
                 plan=plan.model_dump(),
-                observations=bundle.observations[-44:],
-                evidence=bundle.evidence_rows(
-                    max_items=self.settings.agent_evidence_catalog_limit
-                ),
+                observations=bundle.answer_observations(),
+                evidence=bundle.evidence_rows(max_items=evidence_limit),
             )
             if feedback:
                 user_prompt += (

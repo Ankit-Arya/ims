@@ -25,6 +25,10 @@ def deduplicate_candidates(candidates: list[Candidate], *, threshold: float = 0.
             # Never collapse different sections; repetition across a manual can be meaningful.
             if (candidate.section_path or []) != (existing.section_path or []):
                 continue
+            # Distinct table chunks often represent continuation rows of one large table.
+            # Similar headers/labels must not cause later rows to disappear from evidence.
+            if candidate.content_kind == "table" or existing.content_kind == "table":
+                continue
             union = fp | existing_fp
             similarity = len(fp & existing_fp) / max(1, len(union))
             if similarity >= threshold:

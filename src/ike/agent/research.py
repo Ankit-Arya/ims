@@ -110,6 +110,46 @@ class ResearchBundle:
             )
         return rows
 
+    def answer_observations(
+        self,
+        *,
+        max_observations: int = 44,
+        max_items_per_observation: int = 12,
+    ) -> list[dict]:
+        """Compact retrieval observations for the answer LLM.
+
+        Full tool traces remain available in query debug. The answer model receives routing
+        metadata and evidence IDs, while chunk prose is supplied once via evidence_rows().
+        """
+        compact: list[dict] = []
+        for observation in self.observations[-max_observations:]:
+            row = dict(observation)
+            items: list[dict] = []
+            for item in list(observation.get("items") or [])[:max_items_per_observation]:
+                item_row = {
+                    key: value
+                    for key, value in item.items()
+                    if key
+                    in {
+                        "evidence_id",
+                        "chunk_id",
+                        "document_id",
+                        "document_title",
+                        "title",
+                        "filename",
+                        "page_from",
+                        "page_to",
+                        "section_path",
+                        "score",
+                        "metadata_hints",
+                        "matched_sections",
+                    }
+                }
+                items.append(item_row)
+            row["items"] = items
+            compact.append(row)
+        return compact
+
     def candidate_for_evidence(self, evidence_id: str) -> Candidate | None:
         for chunk_id, current_id in self.evidence_id_by_chunk.items():
             if current_id == evidence_id:
@@ -244,7 +284,7 @@ class ResearchExecutor:
             self._record(task=task, result=result, round_name=round_name)
             return
 
-        routed_document_ids: list[str] = []
+        boost_document_ids: list[str] = []
         if task.source_query:
             routing_query = " ".join(
                 value
@@ -253,25 +293,23 @@ class ResearchExecutor:
             )
             routing = self.tools.search_documents(routing_query)
             self._record(task=task, result=routing, round_name=round_name)
-            for item in routing.items:
-                document_id = item.get("document_id")
-                if document_id:
-                    routed_document_ids.append(str(document_id))
-                if len(routed_document_ids) >= self.tools.settings.agent_source_search_documents:
-                    break
+            boost_document_ids = [
+                str(item["document_id"])
+                for item in routing.items
+                if item.get("document_id")
+            ]
 
-        scoped_document_ids = (
-            [task.document_id]
-            if task.document_id
-            else routed_document_ids
-        )
+        # Only an explicit document_id is a hard per-task scope. AI-inferred source
+        # candidates are ranking hints so globally strong chunk evidence can still win.
+        hard_document_ids = [task.document_id] if task.document_id else []
 
         if task.kind == "search":
             result = self.tools.search(
                 task.query,
                 mode=task.search_mode,
                 exact_terms=task.exact_terms,
-                document_ids=scoped_document_ids,
+                document_ids=hard_document_ids,
+                boost_document_ids=boost_document_ids,
                 top_k=task.top_k,
             )
             self._record(task=task, result=result, round_name=round_name)
@@ -283,7 +321,8 @@ class ResearchExecutor:
                 task.query,
                 mode=task.search_mode,
                 exact_terms=task.exact_terms,
-                document_ids=scoped_document_ids,
+                document_ids=hard_document_ids,
+                boost_document_ids=boost_document_ids,
                 top_k=task.top_k,
             )
             self._record(task=task, result=result, round_name=round_name)
